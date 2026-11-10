@@ -284,11 +284,12 @@ impl Reranker for Qwen3Reranker {
         RerankerKind::GenerativeText
     }
 
-    fn score(
+    fn score_until(
         &self,
         query: &RerankItem,
         documents: &[RerankItem],
         instruction: Option<&str>,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores> {
         if query.has_image() || documents.iter().any(RerankItem::has_image) {
             bail!("the Qwen3 reranker is text-only; use a Qwen3-VL reranker for image documents");
@@ -308,6 +309,9 @@ impl Reranker for Qwen3Reranker {
         let mut scores = Vec::with_capacity(rows.len());
         let mut prompt_tokens = 0usize;
         for chunk in rows.chunks(self.batch_size) {
+            if is_abandoned() {
+                bail!(super::RerankAbandoned);
+            }
             let (chunk_scores, tokens) = self.score_rows(chunk)?;
             prompt_tokens += tokens;
             scores.extend(chunk_scores);

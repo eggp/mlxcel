@@ -38,9 +38,10 @@ use mlxcel_core::streams::{
     install_thread_local_default_stream, new_thread_local_generation_stream,
     synchronize_thread_local_stream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::rerank::{
-    LoadedReranker, RerankItem, RerankLoadOptions, RerankScores, RerankerKind,
+    LoadedReranker, RerankAbandoned, RerankItem, RerankLoadOptions, RerankScores, RerankerKind,
     load_reranker_with_options,
 };
 use crate::server::model_provider::{
@@ -70,6 +71,7 @@ enum RerankCommand {
         query: Box<RerankItem>,
         documents: Vec<RerankItem>,
         instruction: Option<String>,
+        cancel: CancellationToken,
         respond: Reply,
     },
     Shutdown,
@@ -81,8 +83,9 @@ pub(crate) struct RerankWorker {
     /// Bounded command channel; the `Mutex` makes the handle `Sync` and is
     /// held only for the enqueue, never across inference.
     sender: Mutex<mpsc::SyncSender<RerankCommand>>,
-    /// Per-request reply timeout. Frees the caller's blocking thread; does not
-    /// cancel the in-flight MLX work.
+    /// Per-request reply timeout. Frees the caller's blocking thread and
+    /// cancels the request's token so a queued command is skipped and an
+    /// in-flight one stops after the current micro-batch.
     request_timeout: Duration,
     info: RerankWorkerInfo,
     /// Watcher thread handle; joining it waits for the worker to free the model.
@@ -186,22 +189,31 @@ impl RerankWorker {
         wait_for_worker_exit(&self.worker_exit, remaining, "rerank model worker")
     }
 
+    /// Score on the worker thread and wait for the reply.
+    ///
+    /// `cancel` follows [`RerankModelProvider::rerank`]: the caller cancels it
+    /// when it stops waiting, and this method cancels it on a reply timeout.
     pub(crate) fn score(
         &self,
         query: RerankItem,
         documents: Vec<RerankItem>,
         instruction: Option<String>,
+        cancel: CancellationToken,
     ) -> Result<RerankScores, RerankError> {
         let (respond, reply) = mpsc::channel();
         self.dispatch(RerankCommand::Score {
             query: Box::new(query),
             documents,
             instruction,
+            cancel: cancel.clone(),
             respond,
         })?;
         match reply.recv_timeout(self.request_timeout) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(RerankError::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.cancel();
+                Err(RerankError::Timeout)
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err(RerankError::Internal(WORKER_GONE.to_string()))
             }
@@ -281,13 +293,26 @@ fn worker_loop<L, C>(
                 query,
                 documents,
                 instruction,
+                cancel,
                 respond,
             } => {
+                if cancel.is_cancelled() {
+                    let _ = respond.send(Err(RerankError::Cancelled));
+                    continue;
+                }
                 let result = run_guarded(stream.as_ref(), || {
                     loaded
                         .reranker
-                        .score(&query, &documents, instruction.as_deref())
-                        .map_err(|err| RerankError::Internal(format!("{err:#}")))
+                        .score_until(&query, &documents, instruction.as_deref(), &|| {
+                            cancel.is_cancelled()
+                        })
+                        .map_err(|err| {
+                            if err.is::<RerankAbandoned>() {
+                                RerankError::Cancelled
+                            } else {
+                                RerankError::Internal(format!("{err:#}"))
+                            }
+                        })
                 });
                 // The request's buffers would otherwise stay in the MLX
                 // buffer cache until the cache limit evicts them. Once per
@@ -403,8 +428,9 @@ impl RerankModelProvider for RerankWorkerProvider {
         query: RerankItem,
         documents: Vec<RerankItem>,
         instruction: Option<String>,
+        cancel: CancellationToken,
     ) -> Result<RerankScores, RerankError> {
-        self.worker.score(query, documents, instruction)
+        self.worker.score(query, documents, instruction, cancel)
     }
 
     fn model_id(&self) -> &str {

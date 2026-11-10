@@ -255,11 +255,12 @@ impl Reranker for SequenceClassifierReranker {
         RerankerKind::SequenceClassifier
     }
 
-    fn score(
+    fn score_until(
         &self,
         query: &RerankItem,
         documents: &[RerankItem],
         _instruction: Option<&str>,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores> {
         if query.has_image() || documents.iter().any(RerankItem::has_image) {
             bail!("a cross-encoder reranker is text-only and does not accept image items");
@@ -268,6 +269,9 @@ impl Reranker for SequenceClassifierReranker {
         let mut scores = Vec::with_capacity(documents.len());
         let mut prompt_tokens = 0usize;
         for chunk in documents.chunks(self.batch_size) {
+            if is_abandoned() {
+                bail!(super::RerankAbandoned);
+            }
             let pairs: Vec<(&str, &str)> = chunk
                 .iter()
                 .map(|document| (query_text, document.text_or_empty()))

@@ -95,6 +95,7 @@ impl RerankModelProvider for SideRerankProvider {
         _query: RerankItem,
         _documents: Vec<RerankItem>,
         _instruction: Option<String>,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<RerankScores, RerankError> {
         unreachable!("availability preflight must prevent rerank dispatch")
     }
