@@ -432,6 +432,132 @@ fn score_until_stops_between_micro_batches_when_abandoned() {
     assert_eq!(checks.get(), 2, "checked before batch 0 and before batch 1");
 }
 
+/// Positions the forward passes compute when `order` is cut into micro-batches
+/// of `batch_size`: every batch is padded to its longest row.
+fn computed_positions(lengths: &[usize], order: &[usize], batch_size: usize) -> usize {
+    order
+        .chunks(batch_size)
+        .map(|chunk| {
+            let width = chunk.iter().map(|&index| lengths[index]).max().unwrap_or(0);
+            width * chunk.len()
+        })
+        .sum()
+}
+
+#[test]
+fn batching_order_puts_rows_of_similar_length_in_one_micro_batch() {
+    let lengths = [3, 9, 2, 8, 1, 7];
+    let arrival: Vec<usize> = (0..lengths.len()).collect();
+    assert_eq!(
+        computed_positions(&lengths, &arrival, 2),
+        48,
+        "arrival order pads every short row to a long one: 2*9 + 2*8 + 2*7"
+    );
+
+    let order = batching_order(&lengths);
+    assert_eq!(order, vec![1, 3, 5, 0, 2, 4], "longest row first");
+    assert_eq!(
+        computed_positions(&lengths, &order, 2),
+        36,
+        "length-sorted batches are 2*9 + 2*7 + 2*2"
+    );
+}
+
+#[test]
+fn batching_order_keeps_arrival_order_among_equal_lengths() {
+    assert_eq!(batching_order(&[4, 6, 4, 6, 4]), vec![1, 3, 0, 2, 4]);
+    assert_eq!(batching_order(&[5, 5, 5]), vec![0, 1, 2]);
+    assert_eq!(batching_order(&[7]), vec![0]);
+    assert!(batching_order(&[]).is_empty());
+}
+
+/// Documents of five different lengths, in an order that is not sorted by
+/// length in either direction.
+fn documents_of_unsorted_lengths() -> Vec<RerankItem> {
+    vec![
+        RerankItem::text("berlin"),
+        RerankItem::text("panda bear china ".repeat(6)),
+        RerankItem::text("capital beijing"),
+        RerankItem::text("germany berlin ".repeat(3)),
+        RerankItem::text("panda china bear"),
+    ]
+}
+
+/// Token count of the prompt row each document encodes to.
+fn row_lengths(reranker: &Qwen3Reranker, query: &str, documents: &[RerankItem]) -> Vec<usize> {
+    documents
+        .iter()
+        .map(|document| {
+            let text = document.text_or_empty();
+            reranker
+                .encode_row(DEFAULT_INSTRUCTION, query, text)
+                .expect("row encodes")
+                .len()
+        })
+        .collect()
+}
+
+#[test]
+fn scores_come_back_at_each_document_s_own_index() {
+    let _guard = mlx_test_guard();
+    let reranker = build(256, 2);
+    let query = RerankItem::text("what is panda?");
+    let documents = documents_of_unsorted_lengths();
+
+    let lengths = row_lengths(&reranker, "what is panda?", &documents);
+    let arrival: Vec<usize> = (0..documents.len()).collect();
+    assert_ne!(
+        batching_order(&lengths),
+        arrival,
+        "the request must be one the reranker reorders, lengths {lengths:?}"
+    );
+
+    // A document scored alone is never padded, so it is the reference for
+    // its own index whatever batch it lands in.
+    let alone: Vec<f32> = documents
+        .iter()
+        .map(|document| {
+            reranker
+                .score(&query, std::slice::from_ref(document), None)
+                .expect("single-document scoring succeeds")
+                .scores[0]
+        })
+        .collect();
+    for (i, a) in alone.iter().enumerate() {
+        for (j, b) in alone.iter().enumerate().skip(i + 1) {
+            assert!(
+                (a - b).abs() > 5e-6,
+                "documents {i} and {j} must score apart for a misplaced score to show: {alone:?}"
+            );
+        }
+    }
+
+    let scored = reranker
+        .score(&query, &documents, None)
+        .expect("scoring succeeds");
+    assert_eq!(scored.scores.len(), documents.len());
+    assert!(
+        max_abs_diff(&scored.scores, &alone) < 1e-6,
+        "scores {:?} are not in document order, each document alone scores {alone:?}",
+        scored.scores
+    );
+}
+
+#[test]
+fn prompt_tokens_count_every_row_once_whatever_the_batching_order() {
+    let _guard = mlx_test_guard();
+    let reranker = build(256, 2);
+    let documents = documents_of_unsorted_lengths();
+    let expected: usize = row_lengths(&reranker, "what is panda?", &documents)
+        .iter()
+        .sum();
+
+    let scored = reranker
+        .score(&RerankItem::text("what is panda?"), &documents, None)
+        .expect("scoring succeeds");
+    assert_eq!(scored.prompt_tokens, expected);
+}
+
 const CHECKPOINT_SEED: u64 = 0x1356_0BAD_F00D;
 const REWRITTEN_SEED: u64 = 0x0DD_C0FF_EE11;
 
