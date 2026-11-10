@@ -107,6 +107,28 @@ impl RerankWorker {
     where
         L: FnOnce() -> anyhow::Result<LoadedReranker> + Send + 'static,
     {
+        Self::spawn_with_cache_clear(
+            thread_name,
+            queue_depth,
+            request_timeout,
+            mlxcel_core::clear_memory_cache,
+            loader,
+        )
+    }
+
+    /// [`Self::spawn`] with the buffer-cache release the worker runs after
+    /// each scoring request passed in, so a test can count the calls.
+    fn spawn_with_cache_clear<C, L>(
+        thread_name: &str,
+        queue_depth: usize,
+        request_timeout: Duration,
+        clear_cache: C,
+        loader: L,
+    ) -> anyhow::Result<Self>
+    where
+        C: Fn() + Send + 'static,
+        L: FnOnce() -> anyhow::Result<LoadedReranker> + Send + 'static,
+    {
         let capacity = queue_depth.max(1);
         let request_timeout = if request_timeout == Duration::ZERO {
             Duration::from_secs(crate::server::config::DEFAULT_EMBEDDING_REQUEST_TIMEOUT_SECS)
@@ -118,7 +140,7 @@ impl RerankWorker {
 
         let handle = thread::Builder::new()
             .name(thread_name.to_string())
-            .spawn(move || worker_loop(loader, command_rx, ready_tx))
+            .spawn(move || worker_loop(loader, clear_cache, command_rx, ready_tx))
             .map_err(|e| anyhow::anyhow!("failed to spawn rerank worker thread: {e}"))?;
 
         match ready_rx.recv() {
@@ -217,12 +239,14 @@ impl Drop for RerankWorker {
 }
 
 /// Body of the worker thread: install the stream, load the model, serve.
-fn worker_loop<L>(
+fn worker_loop<L, C>(
     loader: L,
+    clear_cache: C,
     commands: mpsc::Receiver<RerankCommand>,
     ready: mpsc::Sender<Result<RerankWorkerInfo, String>>,
 ) where
     L: FnOnce() -> anyhow::Result<LoadedReranker>,
+    C: Fn(),
 {
     let stream = new_thread_local_generation_stream();
     install_thread_local_default_stream(stream.as_ref());
@@ -265,6 +289,13 @@ fn worker_loop<L>(
                         .score(&query, &documents, instruction.as_deref())
                         .map_err(|err| RerankError::Internal(format!("{err:#}")))
                 });
+                // The request's buffers would otherwise stay in the MLX
+                // buffer cache until the cache limit evicts them. Once per
+                // request, not per micro-batch: frequent releases cost
+                // throughput. Before the reply, so the release is part of the
+                // request: its cost shows in the latency and the caller sees
+                // the released state.
+                clear_cache();
                 let _ = respond.send(result);
             }
             RerankCommand::Shutdown => break,
