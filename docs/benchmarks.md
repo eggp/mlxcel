@@ -159,6 +159,131 @@ Every drop is reported with its reason. A pair count alone hides what it left ou
 
 The tool exists because six published figures from the 2026-09 campaign were wrong in exactly these ways, and each comparison had been written separately with a different subset of the checks. Replaying them against the tool: the 0.35x cross-host deficit and the 298% margin both refuse outright, the 61% parity figure exits non-zero on the harness mismatch, and the pair count disagreement between two hosts resolves because the roster policy is in one place. The corrected margins reproduce, 105% on M5 Max and 108% on M1 Ultra.
 
+## Replaying recorded rerank requests
+
+`scripts/bench_embeddings.py` times `/v1/rerank` on a few fixed synthetic workloads. `scripts/bench_rerank_replay.py` answers a different question: how one server binary and configuration behaves on several hundred requests a deployment really served, and how that differs from another binary or configuration on the same requests. It starts the server itself, sends every request of a local file to `POST /v1/rerank`, records time, memory and scores per request, stops the server, and compares two such runs. It uses the Python standard library only.
+
+### The request file is private
+
+The request file holds real queries and documents. Keep it outside the repository and pass its path on the command line. The tool sends its text to the local server and nowhere else: result files and console output carry ids, counts, timings, memory figures and scores only, error messages name a line number and never the line, and the server's own stdout and stderr are discarded. Write the result files outside the repository too until you have decided what to publish. An `id` you supply is copied into the result file as is, so do not put request text in it.
+
+One JSON object per line:
+
+```json
+{"id": "optional-string", "query": "...", "documents": ["...", "..."]}
+```
+
+`query` is a string, `documents` a non-empty array of strings, `id` an optional string that must be unique in the file. A request without `id` is identified by its 1-based line number. Blank lines are skipped. Any other malformed line stops the run before a server starts.
+
+### Modes
+
+All three measuring modes take the same server options: `--bin`, `--server-args` (one string, in the `=` form because it starts with a dash), `--env NAME=VALUE` (repeatable), `--port`, `--requests`, `--out`, `--commit` and `--live-traffic yes|no|unknown`. The tool appends `--host 127.0.0.1 --port <port>` to the server arguments.
+
+The port (1 to 65535, default 18091) must be free. The tool reaches its server only through the port, and a port answers for whichever process holds it: with another listener there, the started binary could not bind, and the private requests would be sent to, and the figures taken from, that other process. So the tool connects to `127.0.0.1:<port>` before it executes the binary at all, even for `--version`, and again before each server start. If anything accepts the connection, it stops with exit status 2, names the port, executes nothing and sends nothing. Stop the other listener or pass another `--port`.
+
+This check has a limit that the tool does not close. The check and the server's own bind are two separate steps, so another process can take the port between them. If the started binary then fails to bind and keeps running instead of exiting, the tool sees its own process alive and a port that answers, and it sends the private requests to, and takes the figures from, that other process. Choose a port that nothing else uses, and start no server on it while a run is in progress.
+
+`--out` is checked before anything is executed as well: the path must not be empty, the directory must exist, and the file must be writable, or creatable when it does not exist yet. The check changes nothing: an existing file keeps its content until the run has succeeded and the new result replaces it.
+
+`replay` sends the requests one at a time, after the server answers `GET /v1/models`:
+
+```bash
+scripts/bench_rerank_replay.py replay --bin target/release/mlxcel-server \
+    --server-args="-m <reranker dir> --reranker-model <reranker dir>" \
+    --requests ~/private/rerank-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/replay-base.json
+```
+
+`concurrent` is the same replay with N requests in flight at once; the documented uses are 2 and 3:
+
+```bash
+scripts/bench_rerank_replay.py concurrent --in-flight 2 --bin target/release/mlxcel-server \
+    --server-args="-m <reranker dir> --reranker-model <reranker dir>" \
+    --requests ~/private/rerank-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/concurrent2-base.json
+```
+
+`startup` starts the server K times. Each time it sends the first request of the file as soon as the server accepts a connection, then the same request again. State with `--page-cache warm|cold|unknown` whether the model files were in the page cache before the first start; the value describes the first start only, and the tool records it without checking it:
+
+```bash
+scripts/bench_rerank_replay.py startup --starts 5 --page-cache warm --bin target/release/mlxcel-server \
+    --server-args="-m <reranker dir> --reranker-model <reranker dir>" \
+    --requests ~/private/rerank-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/startup-base.json
+```
+
+`compare` reads two result files written by `replay` or `concurrent` and starts nothing. It refuses a `startup` file:
+
+```bash
+scripts/bench_rerank_replay.py compare --before ~/private/replay-base.json \
+    --after ~/private/replay-fix.json
+```
+
+### Reading a result file
+
+A result file is one JSON object. `run` is recorded once:
+
+| Field | Holds |
+|-------|-------|
+| `mode`, `date` | the mode and the day of the run |
+| `binary`, `binary_version` | the absolute path of `--bin` and what `<bin> --version` printed |
+| `commit`, `live_traffic` | what the operator passed; the tool cannot check either |
+| `server_args` | the server arguments as passed |
+| `env_names`, `env_values` | the name of every `--env` override; the value only for names starting with `MLXCEL_` or `MLX_`, since any other value may be a secret |
+| `in_flight` | requests kept in flight (`replay` and `concurrent`) |
+| `page_cache` | what the operator passed (`startup`) |
+| `footprint_source` | `proc_pid_rusage`, or `unavailable` |
+| `footprint_lifetime_max_bytes` | the largest footprint the server process ever had, read once before it is stopped |
+
+`requests` (`replay`, `concurrent`) has one entry per request, in file order:
+
+| Field | Holds |
+|-------|-------|
+| `id` | the supplied id, or the line number |
+| `documents` | the number of documents |
+| `in_flight` | the `--in-flight` value, 1 for `replay` |
+| `wall_ms` | client-side wall time, request sent to response read |
+| `footprint_peak_bytes` | the largest footprint sampled while the request was open |
+| `footprint_retained_bytes` | the footprint read right after the response |
+| `status`, `error` | the HTTP status, and `null` or one of `http_status`, `bad_response`, `transport:<exception>`; the response body is never recorded |
+| `scores` | `relevance_score` per document in the request's document order, `null` when the request failed |
+
+`starts` (`startup`) has one entry per server start: `first_wall_ms` and `second_wall_ms`, `first_status` and `second_status`, `first_error` and `second_error` (`null`, or the same categories as `error` above, for each of the two requests separately), and `footprint_before_bytes` and `footprint_after_first_bytes` around the first request.
+
+Memory is the physical footprint, `ri_phys_footprint` from `proc_pid_rusage`, sampled about ten times a second and once more at each end of every request. RSS is not used because it does not include the Metal GPU buffers. `proc_pid_rusage` exists on macOS only: on any other platform every footprint field is `null` and `footprint_source` is `unavailable`, and the tool does not substitute another figure. Under `concurrent` the footprint belongs to the whole server process, so the peak of one request includes whatever the other requests in flight held at the time.
+
+A `200` response counts as scored only when it gives every document exactly one finite number: a missing or repeated index, a boolean, `NaN` or an infinity makes the request a `bad_response` failure. `startup` judges both of its requests by the same rule, so a start whose response is such a `200` is a failed start. The result file is strict JSON.
+
+The exit status is 0 when every request was scored, 1 when at least one failed (the result file is still written, with the failures in it), and 2 when the run could not be carried out: a bad request file, a `--port` outside 1 to 65535 or already in use, an empty `--out`, an output directory that is missing or an output file that cannot be written, a binary that does not run, a server that exits early or never becomes ready, a server that exits during the run. To see why a server did not start, run the same binary with the same arguments by hand, since the tool discards its output.
+
+To stop a run by hand, press Ctrl-C. While a request is in flight the tool finishes waiting for that response before it stops its server; a second Ctrl-C stops both at once. An interrupted run writes no result file.
+
+When the server exits during the run, the run stops there. The tool checks its server process before it sends each request and after it reads each response, and once a check has found the process gone it sends nothing more, under `concurrent` either: whatever answered on the port afterwards would not be the binary under test. The check before a request and the sending of that request are one step that only one request at a time goes through, so no request can be on its way out while another one's check finds the process gone. What no client can prevent is a process that dies after that check has passed and before the request has left: that one request still goes to the port, the check after it finds the process gone, and the run stops as described here. The tool prints `error: server exited with code <N> during the run; no result file is written` and exits with status 2. No result file is written, not even a partial one, so a file at `--out` is always a complete run: after such a failure the path holds either nothing or the untouched file of an earlier run. The lines already printed for the requests that finished are all that remains of the stopped run; they are not a result. What the human does: check the date in the `run` object before trusting a file that was already at that path, find the cause by running the binary by hand with the same arguments, then repeat the whole run.
+
+### Reading a comparison
+
+`compare` pairs requests by `id` and prints, as after minus before, the minimum, 5th percentile, median, 95th percentile and maximum of the wall time difference, the peak footprint difference and the retained footprint difference. It then prints the largest absolute score difference over every document of every compared request, and the share of compared requests whose top 5 set and whose top 10 set of documents differ. A request with fewer documents than the cut-off compares all of its documents, so its set cannot differ.
+
+Scores are reproducible for a fixed request, yet they depend on which documents share a micro-batch. A change that reorders documents therefore moves scores slightly without being wrong, and the score difference alone cannot tell that apart from a change that alters results. The top 5 and top 10 shares are what say whether the ranking a caller sees moved.
+
+Nothing is dropped silently. The report counts the requests present in only one file, those that failed in at least one file, and those whose document count differs under the same id, and none of them enter the distributions.
+
+`compare` refuses, with exit status 2, a file it cannot pair reliably. Each entry of `requests` must have every field of the table above, a missing one is not read as `null`, with a string or integer `id`, an integer `documents`, `scores` that is `null` or a non-empty array of finite numbers as long as `documents` says, and `wall_ms` and the two footprint fields `null` or finite numbers. An id may appear once per file. The message names the file and the position of the first unfit entry, or the number of ids that appear more than once, never an id or any other content.
+
+### Two rules for a valid comparison
+
+1. **Alternate the compared configurations.** Run base, candidate, base, candidate, and so on, never all base runs followed by all candidate runs. Thermal state, the page cache and other load drift over a session, and in a blocked order that drift lands on one side.
+2. **State whether live traffic was running.** `--live-traffic` is required because the tool cannot know whether another process was using the same GPU. A pair in which either side says `yes` or `unknown` is not a clean measurement; `compare` prints both values next to the two file names so the pair can be judged.
+
+### Step by step
+
+1. Export the requests into a JSON Lines file outside the repository, in the format above.
+2. Build the two binaries (or pick the two configurations) to compare, and note the revision of each for `--commit`.
+3. Check whether anything else is using the GPU and decide the `--live-traffic` value.
+4. Run `replay` against base, then against the candidate, then base again, then the candidate again, each run with its own `--out` file. Every run prints one line per request and ends with `N of M requests scored, F failed` and the path it wrote. A run that ends with `error:` and exit status 2 wrote nothing: repeat it, and keep the alternating order.
+5. Run `compare --before <base file> --after <candidate file>` for each base and candidate pair. Read the counts first: if many requests failed or are present on one side only, the distributions describe a subset. Then read the distributions and the ranking shares. Compare the two base runs with each other as well; their differences are the noise of the method, and a base to candidate difference inside them is unresolved.
+6. Repeat steps 4 and 5 with `concurrent --in-flight 2` and `--in-flight 3` when behaviour under load is in question, and run `startup` once per configuration when the first request after a start is.
+
 ## Suggested benchmark commands
 
 The repository contains benchmark helper scripts under `scripts/`. The exact
