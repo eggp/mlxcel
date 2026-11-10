@@ -177,7 +177,7 @@ One JSON object per line:
 
 ### Modes
 
-All three measuring modes take the same server options: `--bin`, `--server-args` (one string, in the `=` form because it starts with a dash), `--env NAME=VALUE` (repeatable), `--port`, `--requests`, `--out`, `--commit` and `--live-traffic yes|no|unknown`. The tool appends `--host 127.0.0.1 --port <port>` to the server arguments.
+All four measuring modes take the same server options: `--bin`, `--server-args` (one string, in the `=` form because it starts with a dash), `--env NAME=VALUE` (repeatable), `--port`, `--requests`, `--out`, `--commit` and `--live-traffic yes|no|unknown`. The tool appends `--host 127.0.0.1 --port <port>` to the server arguments.
 
 The port (1 to 65535, default 18091) must be free. The tool reaches its server only through the port, and a port answers for whichever process holds it: with another listener there, the started binary could not bind, and the private requests would be sent to, and the figures taken from, that other process. So the tool connects to `127.0.0.1:<port>` before it executes the binary at all, even for `--version`, and again before each server start. If anything accepts the connection, it stops with exit status 2, names the port, executes nothing and sends nothing. Stop the other listener or pass another `--port`.
 
@@ -212,7 +212,26 @@ scripts/bench_rerank_replay.py startup --starts 5 --page-cache warm --bin target
     --live-traffic no --out ~/private/startup-base.json
 ```
 
-`compare` reads two result files written by `replay` or `concurrent` and starts nothing. It refuses a `startup` file:
+`abandon` measures how long a small request waits behind a large one whose caller has hung up. The probe is the request of the file with the fewest documents, the first such one in file order. Every request with at least `--min-documents` documents is a large request (the documented use is 50). For each large request, in file order, the tool:
+
+1. sends the probe and waits for its answer: the probe alone;
+2. sends the large request and, `--abandon-after` seconds after it was sent (the documented use is 1.0), closes the connection without reading anything from it;
+3. sends the probe again at once and waits for its answer: the probe behind the abandoned request;
+4. sends the probe once more and waits for its answer, so that a server that kept scoring the abandoned request has finished it before the next large request starts, which holds for a server that serves rerank requests in arrival order on one worker.
+
+```bash
+scripts/bench_rerank_replay.py abandon --abandon-after 1.0 --min-documents 50 \
+    --bin target/release/mlxcel-server \
+    --server-args="-m <reranker dir> --reranker-model <reranker dir>" \
+    --requests ~/private/rerank-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/abandon-base.json
+```
+
+A request file with a single request, with no request of at least `--min-documents` documents, or with no request of fewer (the probe would then be a large request itself), is refused before anything is executed. When the server answers a large request before `--abandon-after` has passed, that request was not abandoned: the tool reads and drops the response, records the request as not abandoned and still runs steps 3 and 4. Raise `--min-documents` or lower `--abandon-after` if that happens often. A large request that cannot be sent at all stops the run with exit status 2.
+
+`abandon` measures the wall time the next caller sees, from the client. It does not measure GPU time, and it cannot tell whether the server stopped scoring the abandoned request or finished it quickly: it shows only how long the next request waited.
+
+`compare` reads two result files written by `replay` or `concurrent`, or two written by `abandon`, and starts nothing. It refuses a `startup` file, and a pair in which only one file is an `abandon` result:
 
 ```bash
 scripts/bench_rerank_replay.py compare --before ~/private/replay-base.json \
@@ -230,8 +249,11 @@ A result file is one JSON object. `run` is recorded once:
 | `commit`, `live_traffic` | what the operator passed; the tool cannot check either |
 | `server_args` | the server arguments as passed |
 | `env_names`, `env_values` | the name of every `--env` override; the value only for names starting with `MLXCEL_` or `MLX_`, since any other value may be a secret |
-| `in_flight` | requests kept in flight (`replay` and `concurrent`) |
+| `in_flight` | requests kept in flight (`replay` and `concurrent`); 1 for `abandon`, which waits for one answer at a time |
 | `page_cache` | what the operator passed (`startup`) |
+| `abandon_after_s`, `min_documents` | what the operator passed (`abandon`) |
+| `probe_id`, `probe_documents` | the id and the document count of the probe request (`abandon`) |
+| `large_requests` | the number of requests with at least `min_documents` documents (`abandon`) |
 | `footprint_source` | `proc_pid_rusage`, or `unavailable` |
 | `footprint_lifetime_max_bytes` | the largest footprint the server process ever had, read once before it is stopped |
 
@@ -250,11 +272,22 @@ A result file is one JSON object. `run` is recorded once:
 
 `starts` (`startup`) has one entry per server start: `first_wall_ms` and `second_wall_ms`, `first_status` and `second_status`, `first_error` and `second_error` (`null`, or the same categories as `error` above, for each of the two requests separately), and `footprint_before_bytes` and `footprint_after_first_bytes` around the first request.
 
-Memory is the physical footprint, `ri_phys_footprint` from `proc_pid_rusage`, sampled about ten times a second and once more at each end of every request. RSS is not used because it does not include the Metal GPU buffers. `proc_pid_rusage` exists on macOS only: on any other platform every footprint field is `null` and `footprint_source` is `unavailable`, and the tool does not substitute another figure. Under `concurrent` the footprint belongs to the whole server process, so the peak of one request includes whatever the other requests in flight held at the time.
+`requests` (`abandon`) has one entry per large request, in file order:
+
+| Field | Holds |
+|-------|-------|
+| `id`, `documents` | the large request's id (supplied, or the line number) and its number of documents |
+| `abandoned_after_ms` | the measured time from the large request sent to its connection closed; `null` when the server answered first and the request was not abandoned |
+| `alone_wall_ms`, `alone_status`, `alone_error` | the probe sent before the large request: wall time, HTTP status, and `null` or the error category |
+| `behind_wall_ms`, `behind_status`, `behind_error` | the same for the probe sent right after the large request's connection was closed |
+| `idle_status`, `idle_error` | the status and the error category of the further probe that ends the entry |
+| `footprint_retained_bytes` | the footprint read right after the answer to the probe behind the abandoned request |
+
+Memory is the physical footprint, `ri_phys_footprint` from `proc_pid_rusage`, sampled about ten times a second and once more at each end of every request (`abandon` reads it once per large request and records no peak). RSS is not used because it does not include the Metal GPU buffers. `proc_pid_rusage` exists on macOS only: on any other platform every footprint field is `null` and `footprint_source` is `unavailable`, and the tool does not substitute another figure. Under `concurrent` the footprint belongs to the whole server process, so the peak of one request includes whatever the other requests in flight held at the time.
 
 A `200` response counts as scored only when it gives every document exactly one finite number: a missing or repeated index, a boolean, `NaN` or an infinity makes the request a `bad_response` failure. `startup` judges both of its requests by the same rule, so a start whose response is such a `200` is a failed start. The result file is strict JSON.
 
-The exit status is 0 when every request was scored, 1 when at least one failed (the result file is still written, with the failures in it), and 2 when the run could not be carried out: a bad request file, a `--port` outside 1 to 65535 or already in use, an empty `--out`, an output directory that is missing or an output file that cannot be written, a binary that does not run, a server that exits early or never becomes ready, a server that exits during the run. To see why a server did not start, run the same binary with the same arguments by hand, since the tool discards its output.
+The exit status is 0 when every request was scored (under `abandon`: every probe), 1 when at least one failed (the result file is still written, with the failures in it), and 2 when the run could not be carried out: a bad request file, a `--port` outside 1 to 65535 or already in use, an empty `--out`, an output directory that is missing or an output file that cannot be written, a binary that does not run, a server that exits early or never becomes ready, a server that exits during the run. To see why a server did not start, run the same binary with the same arguments by hand, since the tool discards its output.
 
 To stop a run by hand, press Ctrl-C. While a request is in flight the tool finishes waiting for that response before it stops its server; a second Ctrl-C stops both at once. An interrupted run writes no result file.
 
@@ -270,6 +303,10 @@ Nothing is dropped silently. The report counts the requests present in only one 
 
 `compare` refuses, with exit status 2, a file it cannot pair reliably. Each entry of `requests` must have every field of the table above, a missing one is not read as `null`, with a string or integer `id`, an integer `documents`, `scores` that is `null` or a non-empty array of finite numbers as long as `documents` says, and `wall_ms` and the two footprint fields `null` or finite numbers. An id may appear once per file. The message names the file and the position of the first unfit entry, or the number of ids that appear more than once, never an id or any other content.
 
+For two `abandon` files `compare` pairs the large requests by `id` and compares those that were abandoned in both files with every probe answered. It prints the minimum, 5th percentile, median, 95th percentile and maximum of the probe's wall time behind the abandoned request in the before file, in the after file, and of the per-request difference, after minus before. It prints the same three lines for the probe alone. Read the pair like this: the probe alone is what the probe costs on an idle server, and its difference between the two files is the noise of the method. The probe behind an abandoned request is that cost plus whatever the server still spent on a request nobody was waiting for. The gap between the two figures in one file is therefore the wait the abandoned request caused in that run, and the "after minus before" line of the second figure is how much that wait changed between the files; a difference no larger than the one between the two "alone" lines is unresolved.
+
+The counts come first here too: the large requests present in only one file, those not abandoned in at least one file, and those with a failed probe in at least one file (a request that is both is counted as a failed probe). None of them enter the distributions. Each entry of an `abandon` file must have every field of its table, with `abandoned_after_ms`, the two wall times and the footprint `null` or finite numbers and each error field `null` or a string. A wall time may be `null` only for a failed probe: one whose status is not 200 and whose error field names the category.
+
 ### Two rules for a valid comparison
 
 1. **Alternate the compared configurations.** Run base, candidate, base, candidate, and so on, never all base runs followed by all candidate runs. Thermal state, the page cache and other load drift over a session, and in a blocked order that drift lands on one side.
@@ -283,6 +320,19 @@ Nothing is dropped silently. The report counts the requests present in only one 
 4. Run `replay` against base, then against the candidate, then base again, then the candidate again, each run with its own `--out` file. Every run prints one line per request and ends with `N of M requests scored, F failed` and the path it wrote. A run that ends with `error:` and exit status 2 wrote nothing: repeat it, and keep the alternating order.
 5. Run `compare --before <base file> --after <candidate file>` for each base and candidate pair. Read the counts first: if many requests failed or are present on one side only, the distributions describe a subset. Then read the distributions and the ranking shares. Compare the two base runs with each other as well; their differences are the noise of the method, and a base to candidate difference inside them is unresolved.
 6. Repeat steps 4 and 5 with `concurrent --in-flight 2` and `--in-flight 3` when behaviour under load is in question, and run `startup` once per configuration when the first request after a start is.
+
+### Step by step: the wait behind an abandoned request
+
+Use this when a change is meant to stop the server working on a request whose caller has gone away, for example a client that timed out on a 150-document request while the next caller waits.
+
+1. Use a request file, outside the repository, that holds many requests of at least 50 documents and at least one with fewer than `--min-documents` documents, the smaller the better: the smallest request is the probe, and a file whose smallest request is itself a large one is refused. Every large request gives one measurement, and a handful of them is not a measurement.
+2. Build the base and the candidate binary, note each revision for `--commit`, and decide the `--live-traffic` value.
+3. Run `abandon --abandon-after 1.0 --min-documents 50` against base, then the candidate, then base again, then the candidate again, each run with its own `--out` file. Every run prints one line per large request and ends with `N large requests: A abandoned, B not abandoned, F with a failed probe` and the path it wrote. A run that ends with `error:` and exit status 2 wrote nothing: repeat it, and keep the alternating order.
+4. Run `compare --before <base file> --after <candidate file>` for each pair. Read the counts first: with many requests not abandoned, the server answers them within `--abandon-after`, and the distributions describe the few that are left.
+5. Read the two numbers. "Probe wall time alone" is the cost of the small request on an idle server. "Probe wall time behind an abandoned request" is what the next caller waited. The second minus the first, within one file, is the wait the abandoned request added in that run: the larger it is, the longer the server stayed busy after the caller hung up. Whether a binary shows a large or a small gap is what the run measures.
+6. Compare the two base runs with each other as well. Their differences are the noise of the method, and a base to candidate difference inside them is unresolved.
+
+These are wall times seen by the client. They say how long the next request waited, not how much GPU time the server spent, and not why it waited.
 
 ## Suggested benchmark commands
 
