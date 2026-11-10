@@ -354,7 +354,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                         // working set the model occupies (not just the tensor
                         // sum). Useful for capacity planning and for the future
                         // preflight (#56) which will compare this against
-                        // `MLXCEL_MEMORY_LIMIT` to fail fast.
+                        // `MLXCEL_MEMORY_LIMIT`.
                         let snap = mlxcel_core::memory::snapshot();
                         tracing::info!(
                             worker_model_id = %worker_model_id,
@@ -1305,7 +1305,7 @@ pub(crate) fn spawn_legacy_model_worker(
                     // working set the model occupies (not just the tensor
                     // sum). Useful for capacity planning and for the future
                     // preflight (#56) which will compare this against
-                    // `MLXCEL_MEMORY_LIMIT` to fail fast.
+                    // `MLXCEL_MEMORY_LIMIT`.
                     let snap = mlxcel_core::memory::snapshot();
                     tracing::info!(
                         worker_model_id = %worker_model_id,
