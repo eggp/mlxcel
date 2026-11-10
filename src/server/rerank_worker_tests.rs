@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Rerank worker admission, timeout and panic-recovery gates, over the stub
+//! Rerank worker admission, timeout, panic-recovery and cache-release gates, over the stub
 //! reranker so no checkpoint is needed.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::RerankWorkerProvider;
+use super::{RerankWorker, RerankWorkerProvider};
 use crate::rerank::stub::{STUB_BATCH_SIZE, STUB_MAX_LENGTH, stub_loaded_reranker};
 use crate::rerank::{LoadedReranker, RerankItem, RerankScores, Reranker, RerankerKind};
 use crate::server::rerank_model::{RerankError, RerankModelProvider};
@@ -288,4 +290,79 @@ fn queue_full_returns_queuefull_error() {
         assert!(saw_queue_full, "a full bounded queue must reject admission");
         drop(gate_tx);
     });
+}
+
+/// A stub-backed worker whose cache release only counts its calls.
+fn counting_worker<L>(loader: L) -> (RerankWorker, Arc<AtomicUsize>)
+where
+    L: FnOnce() -> anyhow::Result<LoadedReranker> + Send + 'static,
+{
+    let clears = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&clears);
+    let worker = RerankWorker::spawn_with_cache_clear(
+        "rerank-worker-test",
+        8,
+        Duration::from_secs(30),
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        },
+        loader,
+    )
+    .expect("worker spawns");
+    (worker, clears)
+}
+
+#[test]
+fn loading_and_shutting_down_release_no_cache() {
+    let (worker, clears) =
+        counting_worker(|| Ok(stub_loaded_reranker(RerankerKind::GenerativeText, false)));
+    // Dropping the worker joins its thread, so the count is final.
+    drop(worker);
+    assert_eq!(clears.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn each_scoring_request_releases_the_cache_once() {
+    let (worker, clears) =
+        counting_worker(|| Ok(stub_loaded_reranker(RerankerKind::GenerativeText, false)));
+
+    // The document count does not change the count: the worker releases
+    // per request. The stub does not micro-batch, so this does not observe a
+    // release inside a family's batch loop.
+    let documents: Vec<RerankItem> = (0..STUB_BATCH_SIZE * 3 + 1)
+        .map(|i| RerankItem::text(format!("doc {i}")))
+        .collect();
+    worker
+        .score(query(), documents, None)
+        .expect("scoring succeeds");
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+
+    for _ in 0..3 {
+        worker
+            .score(query(), vec![RerankItem::text("alpha")], None)
+            .expect("scoring succeeds");
+    }
+    assert_eq!(clears.load(Ordering::SeqCst), 4);
+}
+
+#[test]
+fn a_failed_scoring_request_still_releases_the_cache() {
+    let (worker, clears) =
+        counting_worker(|| Ok(stub_loaded_reranker(RerankerKind::GenerativeText, false)));
+    let image = crate::rerank::ImageInput {
+        image: image::DynamicImage::new_rgb8(4, 4),
+    };
+    worker
+        .score(query(), vec![RerankItem::image(image)], None)
+        .expect_err("the text-only stub rejects images");
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_panicking_scoring_request_still_releases_the_cache() {
+    let (worker, clears) = counting_worker(|| Ok(panicking_loaded()));
+    worker
+        .score(query(), vec![RerankItem::text("boom")], None)
+        .expect_err("the sentinel document panics inside the family");
+    assert_eq!(clears.load(Ordering::SeqCst), 1);
 }
