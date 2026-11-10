@@ -806,9 +806,15 @@ struct ServerArgs {
 
     /// Token cap per embedding input (default: derived from the checkpoint)
     ///
-    /// Lowers the limit derived from `sentence_bert_config.json`,
-    /// `tokenizer_config.json` and `config.json` (hard cap 8192). Longer
-    /// inputs are truncated from the right, keeping a trailing special token.
+    /// Sets the ceiling of the limit derived from `sentence_bert_config.json`,
+    /// `processor_config.json`, `tokenizer_config.json` and, on
+    /// absolute-position families, `config.json` `max_position_embeddings`,
+    /// which is 8192 unless this is set. A positive value replaces 8192; a
+    /// smaller value lowers the result, and checkpoint limits still bound a
+    /// larger one. Rotary-position families do not consult
+    /// `max_position_embeddings`, so keep the value within it. Longer inputs
+    /// are truncated from the right, keeping a trailing special token. A larger
+    /// limit costs memory in proportion to the longest input.
     #[arg(
         long = "embedding-max-length",
         env = "MLXCEL_EMBEDDING_MAX_LENGTH",

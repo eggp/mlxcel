@@ -63,7 +63,8 @@ pub struct LoadedEmbeddingModel {
 /// Operator overrides applied while loading.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct EmbeddingLoadOptions {
-    /// `--embedding-max-length`: lowers the derived `max_length`.
+    /// `--embedding-max-length`: replaces the `8192` ceiling of the derived
+    /// `max_length` when positive; checkpoint limits still bound it.
     pub max_length: Option<usize>,
 }
 
