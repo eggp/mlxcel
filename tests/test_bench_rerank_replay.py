@@ -47,7 +47,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import bench_rerank_replay as brr  # noqa: E402
 
 STUB_SERVER = r'''
-import json, os, sys, threading, time
+import json, os, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 mode = sys.argv[1]
@@ -58,8 +58,18 @@ if mode == "never-ready":
     time.sleep(600)
 bias = float(os.environ.get("MLXCEL_STUB_BIAS", "0"))
 barrier = threading.Barrier(int(mode.split("-")[1])) if mode.startswith("barrier-") else None
+# "hold-N" serves one request at a time, as a single rerank worker does, and
+# never answers a request of N or more documents: that one ends when its
+# caller hangs up. What it did is appended to the file MLXCEL_STUB_LOG names.
+hold = int(mode.split("-")[1]) if mode.startswith("hold-") else None
+worker = threading.Lock()
 lock = threading.Lock()
 served = [0]
+
+
+def note(text):
+    with open(os.environ["MLXCEL_STUB_LOG"], "a") as log:
+        log.write(text + "\n")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -88,6 +98,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(500, {"error": request["query"]})
         if mode == "bad-response":
             return self.reply(200, {"results": [{"index": 0}]})
+        if hold is not None:
+            documents = len(request["documents"])
+            with worker:
+                if documents < hold:
+                    note(f"reply {documents}")
+                else:
+                    self.connection.settimeout(30)
+                    try:
+                        gone = self.connection.recv(1) == b""
+                    except socket.timeout:
+                        gone = False
+                    except OSError:
+                        gone = True
+                    if gone:
+                        return note(f"closed {documents}")
+                    note(f"still open {documents}")
+                    return self.reply(504, {"error": "the caller did not hang up"})
         if barrier is not None:
             try:
                 barrier.wait(timeout=10)
@@ -483,6 +510,7 @@ class WrongProcessTest(ToolTestCase):
         for mode, extra in (
             ("replay", []),
             ("startup", ["--starts", "1", "--page-cache", "warm"]),
+            ("abandon", ["--abandon-after", "0.05", "--min-documents", "3"]),
         ):
             with self.subTest(mode=mode), OtherListener() as other:
                 code, _, stderr, result = self.run_tool(mode, extra=extra, port=other.port)
@@ -991,7 +1019,7 @@ class CompareTest(ToolTestCase):
         bad_files = {
             "cannot read": self.tmp / "absent.json",
             "not valid JSON": self.tmp / "broken.json",
-            "not a replay or concurrent result file": self.write_json(
+            "not a replay, concurrent or abandon result file": self.write_json(
                 "startup.json", {"run": {"mode": "startup"}, "starts": []}
             ),
         }
@@ -1109,6 +1137,444 @@ class CompareTest(ToolTestCase):
         self.assertIn("compared: 4 requests scored in both files", stdout)
         self.assertIn("max absolute score difference: 0.5", stdout)
         self.assertIn("top 5 set differs: 0.0% of compared requests", stdout)
+
+
+def recording_connection(events):
+    """An HTTPConnection that appends what happens to each POST to `events`,
+    as ("send" | "read" | "close", document count)."""
+    real = brr.http.client.HTTPConnection
+
+    class RecordingConnection(real):
+        posted = None
+
+        def request(self, method, url, body=None, headers={}, **kwargs):
+            if method == "POST":
+                self.posted = len(json.loads(body)["documents"])
+                events.append(("send", self.posted))
+            return super().request(method, url, body=body, headers=headers, **kwargs)
+
+        def getresponse(self):
+            if self.posted is not None:
+                events.append(("read", self.posted))
+            return super().getresponse()
+
+        def close(self):
+            if self.posted is not None:
+                events.append(("close", self.posted))
+            super().close()
+
+    return RecordingConnection
+
+
+class AbandonTest(ToolTestCase):
+    """REQUESTS has 3, 12, 2 and 1 documents: with `--min-documents 3` the
+    large requests are "alpha" and line 2, and the probe is line 4."""
+
+    def setUp(self):
+        super().setUp()
+        self.log = self.tmp / "stub.log"
+        patcher = mock.patch.object(brr, "REQUEST_TIMEOUT_S", 60.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_abandon(self, stub_mode="hold-3", abandon_after="0.05", min_documents="3", **kwargs):
+        extra = ["--abandon-after", abandon_after, "--min-documents", min_documents,
+                 "--env", f"MLXCEL_STUB_LOG={self.log}"]
+        return self.run_tool("abandon", stub_mode=stub_mode, extra=extra, **kwargs)
+
+    def test_records_one_row_per_large_request(self):
+        code, stdout, _, _ = self.run_abandon()
+        self.assertEqual(code, 0)
+        result = json.loads(
+            self.out.read_text(encoding="utf-8"), parse_constant=reject_constant
+        )
+        rows = result["requests"]
+        self.assertEqual([row["id"] for row in rows], ["alpha", 2])
+        self.assertEqual([row["documents"] for row in rows], [3, 12])
+        for row in rows:
+            self.assertEqual(set(row), set(brr.ABANDON_ROW_KEYS))
+            self.assertGreaterEqual(row["abandoned_after_ms"], 50.0)
+            self.assertGreater(row["alone_wall_ms"], 0)
+            self.assertGreater(row["behind_wall_ms"], 0)
+            for probe in ("alone", "behind", "idle"):
+                self.assertEqual(row[f"{probe}_status"], 200)
+                self.assertIsNone(row[f"{probe}_error"])
+            self.assert_footprint(row["footprint_retained_bytes"])
+        self.assertIn("2 large requests: 2 abandoned, 0 not abandoned", stdout)
+        self.assertIn("0 with a failed probe", stdout)
+
+    def test_records_the_run_once(self):
+        code, _, _, result = self.run_abandon()
+        self.assertEqual(code, 0)
+        run = result["run"]
+        self.assertEqual(run["mode"], "abandon")
+        self.assertEqual(run["abandon_after_s"], 0.05)
+        self.assertEqual(run["min_documents"], 3)
+        self.assertEqual(run["probe_id"], 4)
+        self.assertEqual(run["probe_documents"], 1)
+        self.assertEqual(run["large_requests"], 2)
+        self.assertEqual(run["in_flight"], 1)
+        self.assertEqual(run["commit"], "abc12345")
+        self.assertEqual(run["live_traffic"], "no")
+        self.assertEqual(run["binary"], os.path.abspath(sys.executable))
+        self.assertEqual(run["date"], time.strftime("%Y-%m-%d"))
+        self.assert_footprint(run["footprint_lifetime_max_bytes"])
+
+    def test_probe_is_the_first_request_with_the_fewest_documents(self):
+        self.requests = self.write_requests(
+            [REQUESTS[1], {"id": "first-small", **REQUESTS[3]}, {"id": "second-small", **REQUESTS[3]}]
+        )
+        code, _, _, result = self.run_abandon(stub_mode="ok", abandon_after="30")
+        self.assertEqual(code, 0)
+        self.assertEqual(result["run"]["probe_id"], "first-small")
+        self.assertEqual([row["id"] for row in result["requests"]], [1])
+
+    def test_large_request_is_closed_unread_and_the_probe_is_sent_after_the_close(self):
+        events = []
+        with mock.patch.object(brr.http.client, "HTTPConnection", recording_connection(events)):
+            code, _, _, _ = self.run_abandon()
+        self.assertEqual(code, 0)
+        probe = [("send", 1), ("read", 1)]
+        self.assertEqual(
+            # A probe's connection is closed by the response and by the tool.
+            [event for event in events if event != ("close", 1)],
+            probe + [("send", 3), ("close", 3)] + probe + probe
+            + probe + [("send", 12), ("close", 12)] + probe + probe,
+        )
+
+    def test_server_sees_the_hang_up_and_is_idle_before_the_next_large_request(self):
+        # Per large request the stub answers the probe alone, sees the large
+        # request's caller hang up, then answers the probe behind it and one
+        # more probe before the next large request arrives.
+        code, _, _, _ = self.run_abandon()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            self.log.read_text(encoding="utf-8").split("\n")[:-1],
+            ["reply 1", "closed 3", "reply 1", "reply 1"]
+            + ["reply 1", "closed 12", "reply 1", "reply 1"],
+        )
+
+    def test_large_request_answered_before_the_delay_is_recorded_as_not_abandoned(self):
+        events = []
+        with mock.patch.object(brr.http.client, "HTTPConnection", recording_connection(events)):
+            code, stdout, _, result = self.run_abandon(stub_mode="ok", abandon_after="30")
+        self.assertEqual(code, 0)
+        for row in result["requests"]:
+            self.assertIsNone(row["abandoned_after_ms"])
+            self.assertEqual((row["alone_status"], row["behind_status"]), (200, 200))
+        self.assertIn(("read", 3), events)
+        self.assertIn(("read", 12), events)
+        self.assertIn("2 large requests: 0 abandoned, 2 not abandoned", stdout)
+        self.assertIn("id=alpha docs=3 abandoned=no", stdout)
+
+    def refused_before_anything_runs(self, message, **kwargs):
+        executed = []
+        popen = brr.subprocess.Popen
+
+        def recording_popen(command, *args, **popen_kwargs):
+            executed.append(command)
+            return popen(command, *args, **popen_kwargs)
+
+        with mock.patch.object(brr.subprocess, "Popen", side_effect=recording_popen):
+            code, _, stderr, result = self.run_abandon(**kwargs)
+        self.assertEqual(code, 2)
+        self.assertIn(f"error: {self.requests}: {message}", stderr)
+        self.assertIsNone(result)
+        self.assertEqual(executed, [])
+
+    def test_request_file_without_a_large_request_is_refused(self):
+        self.refused_before_anything_runs(
+            "no request has at least 50 documents", min_documents="50"
+        )
+
+    def test_request_file_with_a_single_request_is_refused(self):
+        self.requests = self.write_requests([REQUESTS[1]])
+        self.refused_before_anything_runs("abandon needs at least two requests")
+
+    def test_request_file_whose_smallest_request_is_a_large_one_is_refused(self):
+        # With 3, 12, 2 and 1 documents and `--min-documents 1` the probe
+        # would be a large request itself.
+        self.refused_before_anything_runs(
+            "the smallest request's document count is 1 and --min-documents is 1",
+            min_documents="1",
+        )
+        self.requests = self.write_requests([REQUESTS[0], REQUESTS[1]])
+        self.refused_before_anything_runs(
+            "the smallest request's document count is 3 and --min-documents is 3"
+        )
+
+    def test_large_request_that_cannot_be_sent_fails_the_run_and_writes_no_result(self):
+        sent = []
+        send_rerank = brr.send_rerank
+
+        def failing_send(port, request):
+            sent.append(len(request.documents))
+            if len(request.documents) >= 3:
+                return None, "transport:ConnectionRefusedError"
+            return send_rerank(port, request)
+
+        with mock.patch.object(brr, "send_rerank", side_effect=failing_send):
+            code, stdout, stderr, result = self.run_abandon()
+        self.assertEqual(code, 2)
+        self.assertIn(
+            "error: the request to abandon could not be sent "
+            "(transport:ConnectionRefusedError); no result file is written",
+            stderr,
+        )
+        self.assertIsNone(result)
+        # The probe alone, then the large request; nothing after the failure.
+        self.assertEqual(sent, [1, 3])
+        self.assertIsNotNone(self.started[0].poll())
+        for text in REQUEST_TEXTS:
+            self.assertNotIn(text, stdout)
+            self.assertNotIn(text, stderr)
+
+    def test_abandon_delay_that_is_not_a_positive_number_is_rejected_by_the_parser(self):
+        for delay in ("0", "-1", "nan", "inf", "soon"):
+            with self.subTest(delay=delay):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                    brr.build_parser().parse_args(
+                        ["abandon", "--bin", "b", "--requests", "r", "--out", "o",
+                         "--commit", "c", "--live-traffic", "no", "--min-documents", "50",
+                         f"--abandon-after={delay}"]
+                    )
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("--abandon-after", stderr.getvalue())
+
+    def test_failed_probe_is_recorded_and_the_file_is_still_written(self):
+        # The stub answers 200 to the first request, the probe alone, and 500
+        # to every later one.
+        code, stdout, _, result = self.run_abandon(stub_mode="second-fails", abandon_after="30")
+        self.assertEqual(code, 1)
+        first = result["requests"][0]
+        self.assertEqual((first["alone_status"], first["alone_error"]), (200, None))
+        self.assertEqual((first["behind_status"], first["behind_error"]), (500, "http_status"))
+        self.assertEqual((first["idle_status"], first["idle_error"]), (500, "http_status"))
+        self.assertGreater(first["behind_wall_ms"], 0)
+        self.assertIn("2 with a failed probe", stdout)
+        # The stub echoes the query in its error body.
+        self.assertNotIn("synthetic query", self.out.read_text(encoding="utf-8") + stdout)
+        self.assertEqual(len(brr.load_result(str(self.out))["requests"]), 2)
+
+    def test_server_that_exits_during_the_scenario_fails_the_run_and_writes_no_result(self):
+        # The second request the stub receives is the first large one.
+        self.out.write_text(EARLIER, encoding="utf-8")
+        code, stdout, stderr, _ = self.run_abandon(stub_mode="dies-on-2", abandon_after="30")
+        self.assertEqual(code, 2)
+        self.assertIn("server exited with code 7 during the run", stderr)
+        self.assertEqual(self.out.read_text(encoding="utf-8"), EARLIER)
+        self.assertNotIn("large requests:", stdout)
+        self.assertNotIn("wrote", stdout)
+
+    def test_request_text_reaches_neither_the_result_file_nor_the_console(self):
+        code, stdout, stderr, _ = self.run_abandon()
+        self.assertEqual(code, 0)
+        written = self.out.read_text(encoding="utf-8")
+        for text in REQUEST_TEXTS:
+            self.assertNotIn(text, written)
+            self.assertNotIn(text, stdout)
+            self.assertNotIn(text, stderr)
+
+
+def abandon_row(request_id, behind, alone=50.0, abandoned=1000.0, behind_error=None):
+    return {
+        "id": request_id,
+        "documents": 150,
+        "abandoned_after_ms": abandoned,
+        "alone_wall_ms": alone,
+        "alone_status": 200,
+        "alone_error": None,
+        "behind_wall_ms": behind,
+        "behind_status": 500 if behind_error else 200,
+        "behind_error": behind_error,
+        "idle_status": 200,
+        "idle_error": None,
+        "footprint_retained_bytes": 500 * MIB,
+    }
+
+
+def abandon_file(rows):
+    run = {"mode": "abandon", "commit": "abc12345", "date": "2026-01-01",
+           "live_traffic": "no", "abandon_after_s": 1.0, "min_documents": 50,
+           "probe_id": "probe", "probe_documents": 1, "large_requests": len(rows)}
+    return {"run": run, "requests": rows}
+
+
+ABANDON_BEFORE = abandon_file(
+    [
+        abandon_row("a", 3400.0, alone=50.0),
+        abandon_row("b", 3000.0, alone=52.0),
+        abandon_row("c", 2600.0, alone=48.0),
+        abandon_row("before-only", 3000.0),
+        abandon_row("early-before", 60.0, abandoned=None),
+        abandon_row("fails-after", 3000.0),
+        abandon_row("early-and-failed", 60.0, abandoned=None),
+    ]
+)
+ABANDON_AFTER = abandon_file(
+    [
+        abandon_row("a", 60.0, alone=51.0),
+        abandon_row("b", 55.0, alone=50.0),
+        abandon_row("c", 70.0, alone=49.0),
+        abandon_row("after-only", 60.0),
+        abandon_row(7, 60.0),
+        abandon_row("early-before", 60.0),
+        abandon_row("fails-after", 5.0, behind_error="http_status"),
+        abandon_row("early-and-failed", 5.0, behind_error="http_status"),
+    ]
+)
+
+
+class AbandonCompareTest(ToolTestCase):
+    def write_json(self, name, data):
+        path = self.tmp / name
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def compare(self, before, after):
+        return self.run_main(
+            ["compare", "--before", str(self.write_json("before.json", before)),
+             "--after", str(self.write_json("after.json", after))]
+        )
+
+    def test_counts_what_is_compared_and_what_is_left_out(self):
+        report = brr.compare_abandon_runs(ABANDON_BEFORE, ABANDON_AFTER)
+        self.assertEqual(report["compared"], 3)
+        self.assertEqual(report["only_before"], 1)
+        self.assertEqual(report["only_after"], 2)
+        self.assertEqual(report["not_abandoned_on_a_side"], 1)
+        # A request with a failed probe is counted here even when it was not
+        # abandoned either.
+        self.assertEqual(report["failed_on_a_side"], 2)
+
+    def test_distributions_cover_the_compared_requests_only(self):
+        report = brr.compare_abandon_runs(ABANDON_BEFORE, ABANDON_AFTER)
+
+        def ends(name):
+            stats = report[name]
+            return stats["n"], stats["min"], stats["median"], stats["max"]
+
+        self.assertEqual(ends("behind_before"), (3, 2600, 3000, 3400))
+        self.assertEqual(ends("behind_after"), (3, 55, 60, 70))
+        self.assertEqual(ends("behind_diff"), (3, -3340, -2945, -2530))
+        self.assertEqual(ends("alone_before"), (3, 48, 50, 52))
+        self.assertEqual(ends("alone_after"), (3, 49, 50, 51))
+        self.assertEqual(ends("alone_diff"), (3, -2, 1, 1))
+        self.assertAlmostEqual(report["behind_diff"]["p5"], -3300.5)
+        self.assertAlmostEqual(report["behind_diff"]["p95"], -2571.5)
+
+    def test_nothing_in_common_reports_no_numbers(self):
+        report = brr.compare_abandon_runs(ABANDON_BEFORE, abandon_file([]))
+        self.assertEqual(report["compared"], 0)
+        self.assertEqual(report["only_before"], 7)
+        self.assertIsNone(report["behind_diff"])
+
+    def test_command_prints_the_report(self):
+        code, stdout, _, _ = self.compare(ABANDON_BEFORE, ABANDON_AFTER)
+        self.assertEqual(code, 0)
+        self.assertIn("abandon_after_s=1.0 min_documents=50 probe_documents=1", stdout)
+        self.assertIn("compared: 3 large requests abandoned in both files", stdout)
+        self.assertIn("only in one file: 1 before, 2 after", stdout)
+        self.assertIn("not abandoned in at least one file: 1", stdout)
+        self.assertIn("failed probe in at least one file: 2", stdout)
+        self.assertIn(
+            "before (ms, n=3): min 2600.00  p5 2640.00  median 3000.00  p95 3360.00  max 3400.00",
+            stdout,
+        )
+        self.assertIn("after (ms, n=3): min 55.00", stdout)
+        self.assertIn(
+            "after minus before (ms, n=3): min -3340.00  p5 -3300.50  median -2945.00"
+            "  p95 -2571.50  max -2530.00",
+            stdout,
+        )
+        self.assertIn("after minus before (ms, n=3): min -2.00  p5 -1.70  median +1.00", stdout)
+
+    def test_files_of_different_modes_are_refused(self):
+        for before, after in ((ABANDON_BEFORE, BEFORE), (BEFORE, ABANDON_AFTER)):
+            with self.subTest(before=before["run"]["mode"]):
+                code, stdout, stderr, _ = self.compare(before, after)
+                self.assertEqual(code, 2)
+                self.assertIn(
+                    f"holds {before['run']['mode']} results and {self.tmp / 'after.json'} "
+                    f"holds {after['run']['mode']} results; abandon results compare only "
+                    "with other abandon results",
+                    stderr,
+                )
+                self.assertEqual(stdout, "")
+
+    def refused(self, row):
+        code, _, stderr, _ = self.compare(ABANDON_BEFORE, abandon_file([row]))
+        self.assertEqual(code, 2)
+        self.assertNotIn("Traceback", stderr)
+        self.assertTrue(stderr.startswith(f"error: {self.tmp / 'after.json'}: "), stderr)
+        return stderr
+
+    def test_abandon_row_without_a_key_the_tool_writes_is_refused(self):
+        full = abandon_row("a", 60.0)
+        self.assertEqual(set(full), set(brr.ABANDON_ROW_KEYS))
+        for key in full:
+            with self.subTest(key=key):
+                row = {name: value for name, value in full.items() if name != key}
+                self.assertIn(f"request entry 1: `{key}` is missing", self.refused(row))
+
+    def test_malformed_abandon_rows_are_refused_without_a_traceback(self):
+        cases = {
+            "boolean id": {"id": True},
+            "list id": {"id": ["a"]},
+            "text documents": {"documents": "150"},
+            "text delay": {"abandoned_after_ms": "1000"},
+            "boolean delay": {"abandoned_after_ms": True},
+            "text wall time": {"behind_wall_ms": "slow"},
+            "text footprint": {"footprint_retained_bytes": "big"},
+            "error that is not text": {"alone_error": 1},
+            "answered probe without a wall time": {"behind_wall_ms": None},
+            "answered probe without a wall time, with an error": {
+                "alone_wall_ms": None, "alone_error": "bad_response"
+            },
+            "no wall time and no error": {"alone_wall_ms": None, "alone_status": None},
+        }
+        for name, changes in cases.items():
+            with self.subTest(name):
+                self.assertIn("request entry 1", self.refused({**abandon_row("a", 60.0), **changes}))
+
+    def test_failed_probe_rows_are_accepted_and_counted(self):
+        failed = [
+            abandon_row("a", 5.0, behind_error="http_status"),
+            {**abandon_row("b", 5.0), "behind_status": None,
+             "behind_error": "transport:ConnectionResetError"},
+            {**abandon_row("c", None), "behind_status": None,
+             "behind_error": "transport:ConnectionResetError"},
+        ]
+        code, stdout, _, _ = self.compare(ABANDON_BEFORE, abandon_file(failed))
+        self.assertEqual(code, 0)
+        self.assertIn("compared: 0 large requests", stdout)
+        self.assertIn("failed probe in at least one file: 3", stdout)
+
+    def test_replay_rows_under_the_abandon_mode_are_refused(self):
+        self.assertIn("request entry 1", self.refused(result_row("a", TWELVE)))
+
+    def test_abandon_file_with_a_repeated_id_is_refused(self):
+        code, _, stderr, _ = self.compare(
+            ABANDON_BEFORE, abandon_file([abandon_row("twice", 60.0), abandon_row("twice", 60.0)])
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("1 ids appear more than once", stderr)
+
+    def test_two_abandon_runs_of_the_stub_compare_end_to_end(self):
+        first, second = self.tmp / "first.json", self.tmp / "second.json"
+        for out in (first, second):
+            extra = ["--abandon-after", "0.05", "--min-documents", "3",
+                     "--env", f"MLXCEL_STUB_LOG={self.tmp / 'stub.log'}"]
+            self.assertEqual(
+                self.run_tool("abandon", stub_mode="hold-3", extra=extra, out=out)[0], 0
+            )
+        code, stdout, _, _ = self.run_main(
+            ["compare", "--before", str(first), "--after", str(second)]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("compared: 2 large requests abandoned in both files", stdout)
+        self.assertIn("failed probe in at least one file: 0", stdout)
 
 
 if __name__ == "__main__":

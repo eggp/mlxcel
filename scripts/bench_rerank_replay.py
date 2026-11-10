@@ -41,7 +41,9 @@ Modes:
   replay      one request at a time
   concurrent  the same with N requests in flight
   startup     K fresh server starts, the first request sent twice per start
-  compare     two replay or concurrent result files
+  abandon     how long a small request waits behind a large one whose caller
+              hung up
+  compare     two replay or concurrent result files, or two abandon ones
 
 Examples:
   scripts/bench_rerank_replay.py replay --bin target/release/mlxcel-server \\
@@ -65,6 +67,7 @@ import http.client
 import json
 import math
 import os
+import select
 import shlex
 import socket
 import statistics
@@ -383,6 +386,39 @@ def post_to_running(proc: subprocess.Popen, port: int, request: RerankRequest):
     return wall_ms, status, scores, error
 
 
+def abandon_request(
+    proc: subprocess.Popen, port: int, request: RerankRequest, delay_s: float
+) -> float | None:
+    """Send one request and hang up `delay_s` seconds later, reading nothing.
+
+    Returns the delay applied, in ms from the request sent to the connection
+    closed. Returns None when the server answered within the delay: that
+    response is read and dropped, and the request was not abandoned. Raises
+    ServerError when the server is found dead, or the request cannot be sent.
+    """
+    with SEND_LOCK:
+        require_running(proc)
+        conn, error = send_rerank(port, request)
+        sent = time.perf_counter()
+    if conn is None:
+        with SEND_LOCK:
+            require_running(proc, settle=True)
+        raise ServerError(
+            f"the request to abandon could not be sent ({error}); "
+            "no result file is written"
+        )
+    remaining = delay_s
+    while remaining > 0:
+        if select.select([conn.sock], [], [], remaining)[0]:
+            status, _, _ = read_rerank(conn, len(request.documents))
+            with SEND_LOCK:
+                require_running(proc, settle=status is None)
+            return None
+        remaining = sent + delay_s - time.perf_counter()
+    conn.close()
+    return round((time.perf_counter() - sent) * 1000.0, 3)
+
+
 def require_free_port(port: int) -> None:
     """Refuse a port that already accepts connections.
 
@@ -670,6 +706,105 @@ def run_startup(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
+# The keys of a row `run_abandon` writes.
+ABANDON_ROW_KEYS = (
+    "id",
+    "documents",
+    "abandoned_after_ms",
+    "alone_wall_ms",
+    "alone_status",
+    "alone_error",
+    "behind_wall_ms",
+    "behind_status",
+    "behind_error",
+    "idle_status",
+    "idle_error",
+    "footprint_retained_bytes",
+)
+ABANDON_PROBES = ("alone", "behind", "idle")
+
+
+def probe_failed(row: dict) -> bool:
+    return any(row[f"{probe}_error"] is not None for probe in ABANDON_PROBES)
+
+
+def run_abandon(args: argparse.Namespace) -> int:
+    requests = load_requests(args.requests)
+    if len(requests) < 2:
+        raise InputError(
+            f"{args.requests}: abandon needs at least two requests, "
+            "a probe and a request to abandon"
+        )
+    large = [r for r in requests if len(r.documents) >= args.min_documents]
+    if not large:
+        raise InputError(
+            f"{args.requests}: no request has at least {args.min_documents} documents"
+        )
+    # `min` keeps the first of several smallest requests.
+    probe = min(requests, key=lambda request: len(request.documents))
+    if len(probe.documents) >= args.min_documents:
+        raise InputError(
+            f"{args.requests}: the smallest request's document count is "
+            f"{len(probe.documents)} and --min-documents is {args.min_documents}; "
+            "the probe must be smaller than a large request"
+        )
+    run = run_record(args)
+    run["in_flight"] = 1
+    run["abandon_after_s"] = args.abandon_after
+    run["min_documents"] = args.min_documents
+    run["probe_id"] = probe.id
+    run["probe_documents"] = len(probe.documents)
+    run["large_requests"] = len(large)
+    rows = []
+    with running_server(args, answers_http) as proc:
+        for request in large:
+            alone_ms, alone_status, _, alone_error = post_to_running(proc, args.port, probe)
+            abandoned_after_ms = abandon_request(proc, args.port, request, args.abandon_after)
+            behind_ms, behind_status, _, behind_error = post_to_running(proc, args.port, probe)
+            retained = read_footprint(proc.pid)
+            # A server that kept scoring the abandoned request has finished it
+            # once the probe behind it and one more probe have been answered,
+            # if it serves rerank requests in arrival order on one worker.
+            _, idle_status, _, idle_error = post_to_running(proc, args.port, probe)
+            rows.append(
+                {
+                    "id": request.id,
+                    "documents": len(request.documents),
+                    "abandoned_after_ms": abandoned_after_ms,
+                    "alone_wall_ms": alone_ms,
+                    "alone_status": alone_status,
+                    "alone_error": alone_error,
+                    "behind_wall_ms": behind_ms,
+                    "behind_status": behind_status,
+                    "behind_error": behind_error,
+                    "idle_status": idle_status,
+                    "idle_error": idle_error,
+                    "footprint_retained_bytes": retained,
+                }
+            )
+            delay = (
+                "abandoned=no"
+                if abandoned_after_ms is None
+                else f"abandoned_after_ms={abandoned_after_ms:.1f}"
+            )
+            print(
+                f"id={request.id} docs={len(request.documents)} {delay} "
+                f"alone_ms={alone_ms:.1f} status={alone_status} "
+                f"behind_ms={behind_ms:.1f} status={behind_status} "
+                f"idle_status={idle_status} retained_mib={mib(retained)}",
+                flush=True,
+            )
+        run["footprint_lifetime_max_bytes"] = read_lifetime_max_footprint(proc.pid)
+    abandoned = sum(1 for row in rows if row["abandoned_after_ms"] is not None)
+    failed = sum(1 for row in rows if probe_failed(row))
+    print(
+        f"{len(rows)} large requests: {abandoned} abandoned, "
+        f"{len(rows) - abandoned} not abandoned, {failed} with a failed probe"
+    )
+    write_result(args.out, {"run": run, "requests": rows})
+    return 1 if failed else 0
+
+
 # --- compare -----------------------------------------------------------------
 
 
@@ -687,6 +822,53 @@ REQUEST_ROW_KEYS = (
 )
 
 
+def entry_defect(row, keys: tuple, numbers: tuple) -> str | None:
+    """What is wrong with `row` in the part every mode's rows share, or None:
+    every key in `keys` present, a usable `id`, an integer `documents`, and
+    each key in `numbers` null or a finite number."""
+    if not isinstance(row, dict):
+        return "not a JSON object"
+    for name in keys:
+        if name not in row:
+            return f"`{name}` is missing"
+    request_id = row["id"]
+    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
+        return "`id` must be a string or an integer"
+    if type(row["documents"]) is not int:
+        return "`documents` must be an integer"
+    for name in numbers:
+        if row[name] is not None and not is_finite_number(row[name]):
+            return f"`{name}` must be null or a finite number"
+    return None
+
+
+def abandon_row_defect(row) -> str | None:
+    """What makes an `abandon` row unusable for a comparison, or None.
+
+    The error fields decide whether a probe failed, so each must be null or a
+    string, and a probe without a wall time must be a failed one: a compared
+    row then has both wall times.
+    """
+    defect = entry_defect(
+        row,
+        ABANDON_ROW_KEYS,
+        ("abandoned_after_ms", "alone_wall_ms", "behind_wall_ms", "footprint_retained_bytes"),
+    )
+    if defect:
+        return defect
+    for probe in ABANDON_PROBES:
+        error = row[f"{probe}_error"]
+        if error is not None and not isinstance(error, str):
+            return f"`{probe}_error` must be null or a string"
+    for probe in ("alone", "behind"):
+        if row[f"{probe}_wall_ms"] is None:
+            if row[f"{probe}_status"] == 200:
+                return f"`{probe}_wall_ms` is null although `{probe}_status` is 200"
+            if row[f"{probe}_error"] is None:
+                return f"`{probe}_wall_ms` is null although `{probe}_error` is null too"
+    return None
+
+
 def row_defect(row) -> str | None:
     """What makes `row` unusable for a comparison, or None.
 
@@ -694,20 +876,12 @@ def row_defect(row) -> str | None:
     (`scores` null) or carries one finite score per document. The replay path never scores a request without documents,
     so an empty score list is refused rather than compared.
     """
-    if not isinstance(row, dict):
-        return "not a JSON object"
-    for name in REQUEST_ROW_KEYS:
-        if name not in row:
-            return f"`{name}` is missing"
-    request_id = row["id"]
-    if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
-        return "`id` must be a string or an integer"
+    defect = entry_defect(
+        row, REQUEST_ROW_KEYS, ("wall_ms", "footprint_peak_bytes", "footprint_retained_bytes")
+    )
+    if defect:
+        return defect
     documents, scores = row["documents"], row["scores"]
-    if type(documents) is not int:
-        return "`documents` must be an integer"
-    for name in ("wall_ms", "footprint_peak_bytes", "footprint_retained_bytes"):
-        if row[name] is not None and not is_finite_number(row[name]):
-            return f"`{name}` must be null or a finite number"
     if scores is None:
         return None
     if not isinstance(scores, list) or not scores:
@@ -719,8 +893,16 @@ def row_defect(row) -> str | None:
     return None
 
 
+# The check each comparable mode's rows must pass.
+ROW_DEFECTS = {
+    "replay": row_defect,
+    "concurrent": row_defect,
+    "abandon": abandon_row_defect,
+}
+
+
 def load_result(path: str) -> dict:
-    """Read and validate a replay or concurrent result file.
+    """Read and validate a replay, concurrent or abandon result file.
 
     Error messages name the file and the entry's position, never its content.
     """
@@ -733,14 +915,11 @@ def load_result(path: str) -> dict:
         raise InputError(f"{path}: not valid JSON") from None
     run = data.get("run") if isinstance(data, dict) else None
     rows = data.get("requests") if isinstance(data, dict) else None
-    if (
-        not isinstance(run, dict)
-        or run.get("mode") not in ("replay", "concurrent")
-        or not isinstance(rows, list)
-    ):
-        raise InputError(f"{path}: not a replay or concurrent result file")
+    mode = run.get("mode") if isinstance(run, dict) else None
+    if not isinstance(mode, str) or mode not in ROW_DEFECTS or not isinstance(rows, list):
+        raise InputError(f"{path}: not a replay, concurrent or abandon result file")
     for position, row in enumerate(rows, start=1):
-        defect = row_defect(row)
+        defect = ROW_DEFECTS[mode](row)
         if defect:
             raise InputError(f"{path}: request entry {position}: {defect}")
     counts = collections.Counter(row["id"] for row in rows)
@@ -823,17 +1002,101 @@ def compare_runs(before: dict, after: dict) -> dict:
     return report
 
 
-def format_spread(label: str, stats: dict | None, scale: float, unit: str) -> str:
+def compare_abandon_runs(before: dict, after: dict) -> dict:
+    """The probe's wall time behind an abandoned request and alone, per file
+    and as after minus before, over the large requests that were abandoned in
+    both runs with every probe answered."""
+    before_rows = {row["id"]: row for row in before["requests"]}
+    after_rows = {row["id"]: row for row in after["requests"]}
+    shared = [request_id for request_id in before_rows if request_id in after_rows]
+    values: dict[str, list[float]] = {
+        f"{probe}_{side}": []
+        for probe in ("behind", "alone")
+        for side in ("before", "after", "diff")
+    }
+    failed = not_abandoned = compared = 0
+    for request_id in shared:
+        b, a = before_rows[request_id], after_rows[request_id]
+        if probe_failed(b) or probe_failed(a):
+            failed += 1
+            continue
+        if b["abandoned_after_ms"] is None or a["abandoned_after_ms"] is None:
+            not_abandoned += 1
+            continue
+        compared += 1
+        for probe in ("behind", "alone"):
+            b_ms, a_ms = b[f"{probe}_wall_ms"], a[f"{probe}_wall_ms"]
+            values[f"{probe}_before"].append(b_ms)
+            values[f"{probe}_after"].append(a_ms)
+            values[f"{probe}_diff"].append(a_ms - b_ms)
+    report = {
+        "only_before": len(before_rows) - len(shared),
+        "only_after": len(after_rows) - len(shared),
+        "failed_on_a_side": failed,
+        "not_abandoned_on_a_side": not_abandoned,
+        "compared": compared,
+    }
+    for name, series in values.items():
+        report[name] = spread(series)
+    return report
+
+
+def format_spread(
+    label: str, stats: dict | None, scale: float, unit: str, sign: str = "+"
+) -> str:
+    """One line for a distribution; `sign=""` for values that are not differences."""
     if stats is None:
         return f"{label}: no data"
     parts = "  ".join(
-        f"{key} {stats[key] / scale:+.2f}" for key in ("min", "p5", "median", "p95", "max")
+        f"{key} {stats[key] / scale:{sign}.2f}" for key in ("min", "p5", "median", "p95", "max")
     )
     return f"{label} ({unit}, n={stats['n']}): {parts}"
 
 
+def print_abandon_comparison(args: argparse.Namespace, before: dict, after: dict) -> None:
+    for label, path, data in (("before", args.before, before), ("after", args.after, after)):
+        run = data["run"]
+        print(
+            f"{label}: {path}  commit={run.get('commit')} date={run.get('date')} "
+            f"abandon_after_s={run.get('abandon_after_s')} "
+            f"min_documents={run.get('min_documents')} "
+            f"probe_documents={run.get('probe_documents')} "
+            f"live_traffic={run.get('live_traffic')} requests={len(data['requests'])}"
+        )
+    report = compare_abandon_runs(before, after)
+    print()
+    print(
+        f"compared: {report['compared']} large requests abandoned in both files, "
+        "every probe answered"
+    )
+    print(
+        f"only in one file: {report['only_before']} before, {report['only_after']} after"
+    )
+    print(f"not abandoned in at least one file: {report['not_abandoned_on_a_side']}")
+    print(f"failed probe in at least one file: {report['failed_on_a_side']}")
+    for probe, title in (
+        ("behind", "probe wall time behind an abandoned request"),
+        ("alone", "probe wall time alone, the noise reference"),
+    ):
+        print()
+        print(title)
+        print(format_spread("before", report[f"{probe}_before"], 1.0, "ms", sign=""))
+        print(format_spread("after", report[f"{probe}_after"], 1.0, "ms", sign=""))
+        print(format_spread("after minus before", report[f"{probe}_diff"], 1.0, "ms"))
+
+
 def run_compare(args: argparse.Namespace) -> int:
     before, after = load_result(args.before), load_result(args.after)
+    modes = [data["run"]["mode"] for data in (before, after)]
+    if "abandon" in modes:
+        if modes != ["abandon", "abandon"]:
+            raise InputError(
+                f"{args.before} holds {modes[0]} results and {args.after} holds "
+                f"{modes[1]} results; abandon results compare only with other "
+                "abandon results"
+            )
+        print_abandon_comparison(args, before, after)
+        return 0
     for label, path, data in (("before", args.before, before), ("after", args.after, after)):
         run = data["run"]
         print(
@@ -887,6 +1150,13 @@ def positive_int(text: str) -> int:
     value = int(text)
     if value < 1:
         raise argparse.ArgumentTypeError("must be at least 1")
+    return value
+
+
+def positive_seconds(text: str) -> float:
+    value = float(text)
+    if not (math.isfinite(value) and value > 0):
+        raise argparse.ArgumentTypeError("must be a positive number of seconds")
     return value
 
 
@@ -970,8 +1240,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     startup.set_defaults(run=run_startup)
 
+    abandon = modes.add_parser(
+        "abandon",
+        parents=[server],
+        help=(
+            "time the smallest request alone and right after hanging up on each "
+            "large request"
+        ),
+    )
+    abandon.add_argument(
+        "--abandon-after",
+        type=positive_seconds,
+        required=True,
+        metavar="SECONDS",
+        help=(
+            "how long a large request is left open before its connection is "
+            "closed unread (the documented use is 1.0)"
+        ),
+    )
+    abandon.add_argument(
+        "--min-documents",
+        type=positive_int,
+        required=True,
+        help=(
+            "a request with at least this many documents is a large request "
+            "(the documented use is 50)"
+        ),
+    )
+    abandon.set_defaults(run=run_abandon)
+
     compare = modes.add_parser(
-        "compare", help="compare two replay or concurrent result files"
+        "compare",
+        help="compare two replay or concurrent result files, or two abandon result files",
     )
     compare.add_argument("--before", required=True, help="baseline result file")
     compare.add_argument("--after", required=True, help="result file being judged")
