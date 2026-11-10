@@ -142,7 +142,7 @@ pub fn host_shadow_memory() -> u64 {
 ///
 /// Exceeding the limit during graph evaluation will raise an MLX exception
 /// once the host is also out of RAM (including swap). Used by the
-/// preflight hook (#56) to fail fast instead of thrashing.
+/// preflight hook (#56).
 ///
 /// Passing `bytes = 0` removes the explicit limit on backends that
 /// implement it as "unbounded"; on Metal / CUDA it falls back to the
