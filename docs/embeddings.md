@@ -98,7 +98,7 @@ The resolved family is keyed on `model_type`:
 
 A pooling layout on any other `model_type` is reported as an error naming the `model_type`, rather than misrouted to a causal generator. `Qwen3ForCausalLM` without a pooling layout still detects as the `Qwen3` generator.
 
-`mlxcel arch` lists the embedding variants under the `Embedding` family and `SequenceClassifier` under `Reranker`. The generation loader (`load_model`, used by `mlxcel generate`, `mlxcel run` and the chat worker) rejects every embedding variant with a message pointing at `/v1/embeddings` and `mlxcel embed`, so `mlxcel-server -m <embedding checkpoint>` serves embeddings and leaves chat unloaded (the same way a Whisper checkpoint leaves chat unloaded), and `/v1/chat/completions` returns the existing "model is not loaded" error.
+`mlxcel arch` lists the embedding variants under the `Embedding` family and `SequenceClassifier` under `Reranker`. The generation loader (`load_model`, used by `mlxcel generate`, `mlxcel run` and the chat worker) rejects every embedding variant with a message pointing at `/v1/embeddings` and `mlxcel embed`. The server checks the model type before it builds the chat provider, so on the MLX path `mlxcel-server -m <embedding checkpoint>` serves embeddings from the embedding worker and starts the chat provider without a chat model: the rejected chat load is never attempted (the same way a Whisper checkpoint leaves chat unloaded). An `xla-iree` build with `MLXCEL_BACKEND=xla` returns before this check, so there the checkpoint still goes through the OpenXLA startup load. `/v1/chat/completions` returns the existing chat-unavailable error.
 
 ## Pooling
 
@@ -123,9 +123,9 @@ Normalization is L2 per vector, `v / max(||v||_2, 1e-9)`, applied when `Embeddin
 
 ## Length limits and padding
 
-`max_length` is the smallest of: `sentence_bert_config.json` `max_seq_length` when present; `processor_config.json` `max_length` or `p_max_length` when present; `tokenizer_config.json` `model_max_length` when `0 < value < 1_000_000`; `config.json` `max_position_embeddings` for absolute-position encoders (BERT, XLM-RoBERTa, SigLIP); the hard cap `8192`; and `--embedding-max-length` when set. Inputs longer than `max_length` are truncated from the right after special tokens are added, keeping the trailing special token when the tokenizer appends one, so a BERT input keeps its `[SEP]` and a Qwen3-Embedding input keeps its `<|endoftext|>`. Token-id inputs are truncated from the right verbatim.
+`max_length` is the smallest of: `sentence_bert_config.json` `max_seq_length` when present; `processor_config.json` `max_length` or `p_max_length` when present; `tokenizer_config.json` `model_max_length` when `0 < value < 1_000_000`; `config.json` `max_position_embeddings` for absolute-position encoders (BERT, XLM-RoBERTa, SigLIP); and the ceiling, which is the default `8192` and is replaced by a positive `--embedding-max-length`. A larger override is still bounded by `sentence_bert_config.json`, `processor_config.json` and `tokenizer_config.json`, and by `config.json` `max_position_embeddings` on absolute-position families; a smaller override lowers the result. Rotary-position families do not consult `max_position_embeddings`, so an override above it is accepted and embeds beyond the trained range without an error: keep the override within the checkpoint's `max_position_embeddings`. With `--embedding-max-length` unset or `0`, the ceiling stays `8192`. A larger limit costs memory in proportion to the longest input the server embeds. Inputs longer than `max_length` are truncated from the right after special tokens are added, keeping the trailing special token when the tokenizer appends one, so a BERT input keeps its `[SEP]` and a Qwen3-Embedding input keeps its `<|endoftext|>`. Token-id inputs are truncated from the right verbatim.
 
-For `sentence-transformers/all-MiniLM-L6-v2` this resolves to `256` (from `sentence_bert_config.json`); for `Qwen/Qwen3-Embedding-0.6B` to the cap of `8192` (no `sentence_bert_config.json`, `model_max_length` 131072, rotary positions so `max_position_embeddings` is not consulted).
+For `sentence-transformers/all-MiniLM-L6-v2` this resolves to `256` (from `sentence_bert_config.json`); for `Qwen/Qwen3-Embedding-0.6B` to the default cap of `8192` (no `sentence_bert_config.json`, `model_max_length` 131072, rotary positions so `max_position_embeddings` is not consulted).
 
 Micro-batches are right-padded to their longest member (or to a fixed width when the family requires one, as SigLIP text does) with the pad token id: `tokenizer_config.json` `pad_token`, falling back to `eos_token`, then `0`. Any padding or truncation baked into `tokenizer.json` (MiniLM pads to a fixed 128) is stripped at load, because the engine pads per micro-batch and truncates per checkpoint limit.
 
@@ -232,7 +232,7 @@ mlxcel embed -m mlx-community/embeddinggemma-300m-4bit \
 
 The causal Qwen3 backbone with a causal-plus-padding mask and last-token pooling: the sentence embedding is the hidden state at the `<|endoftext|>` the tokenizer appends. Batches are right-padded, which leaves the causal mask over the real tokens identical to the unpadded single-row case. The tied `lm_head` is dropped at load, and the backbone stops at the final norm, so no `[B, L, vocab_size]` logit tensor is ever built.
 
-Queries use `Instruct: {task}\nQuery: {query}` and documents are raw text. Pass the task through `instruction` (or `--instruction`) and the family wraps the text; send the fully formatted string and leave `instruction` unset to do it yourself. `instruction` applies to every input of the request, so a mixed query-and-document batch either splits into two requests or formats its queries in the text itself. `max_length` is the hard cap of 8192. The checkpoint supports `dimensions` from 32 to 1024.
+Queries use `Instruct: {task}\nQuery: {query}` and documents are raw text. Pass the task through `instruction` (or `--instruction`) and the family wraps the text; send the fully formatted string and leave `instruction` unset to do it yourself. `instruction` applies to every input of the request, so a mixed query-and-document batch either splits into two requests or formats its queries in the text itself. `max_length` resolves to the default ceiling of 8192. The checkpoint supports `dimensions` from 32 to 1024.
 
 ```sh
 mlxcel embed -m Qwen/Qwen3-Embedding-0.6B \
@@ -254,7 +254,7 @@ Unlike every other family, the input is not embedded verbatim: the checkpoint's 
 <|im_start|>assistant
 ```
 
-The instruction defaults to the checkpoint's `config_sentence_transformers.json` prompt (`Represent the user's input.` on the published 2B). Pass `instruction` on the request or `--instruction` on the CLI to override it; an instruction that ends mid-sentence gets a trailing `.`, matching the reference wrapper. `max_length` is the hard cap of 8192 and the vector is 2048-dimensional.
+The instruction defaults to the checkpoint's `config_sentence_transformers.json` prompt (`Represent the user's input.` on the published 2B). Pass `instruction` on the request or `--instruction` on the CLI to override it; an instruction that ends mid-sentence gets a trailing `.`, matching the reference wrapper. `max_length` resolves to the default ceiling of 8192 and the vector is 2048-dimensional.
 
 Image items are accepted. The engine tokenizes before the family sees the image, so the template emits exactly one `<|image_pad|>` and `EmbeddingModel::expand_image_tokens` grows it to the patch count the Qwen2-VL processor computes for that image, before the row is padded; the forward pass then merges the vision features at those positions. The pixel bounds come from the checkpoint's `preprocessor_config.json` rather than the generative defaults, which keeps one image at 1280 visual tokens on the published 2B. Images run one per forward pass because both the DeepStack injection and the M-RoPE delta are per sequence.
 
@@ -337,7 +337,7 @@ The published export saves the inner `LlamaBidirectionalModel`, so the roots arr
 
 LLM2Vec checkpoints that ship as PEFT adapters are not loadable. A directory carrying `adapter_model.safetensors` and no full shard is rejected with a message saying to merge the adapter into its base model and export a complete `LlamaBidirectionalModel` checkpoint first; mlxcel does not merge adapters.
 
-`max_length` is 8192 (`sentence_bert_config.json`, which happens to equal the hard cap). Prompt prefixes from `config_sentence_transformers.json`, applied by the caller: `query: ` before a query, `passage: ` before a document.
+`max_length` is 8192 (`sentence_bert_config.json`, which happens to equal the default ceiling). Prompt prefixes from `config_sentence_transformers.json`, applied by the caller: `query: ` before a query, `passage: ` before a document.
 
 ```sh
 mlxcel embed -m nvidia/llama-nemotron-embed-1b-v2 \
@@ -353,7 +353,7 @@ Two details carry the port. The per-position Llama 4 attention scale (`1 + beta 
 
 Rotary frequencies are YaRN. Both checkpoints declare `rope_type: yarn` (`factor` 16, `original_max_position_embeddings` 16384) alongside a NeMo export key `apply_yarn_scaling: false`; Hugging Face Transformers (checked at 5.20) ignores that key and applies YaRN, and so does this port since `lablup/mlxcel#2345`, through the shared Ministral 3 attention. Before that change the backbone rotated with plain RoPE, so embeddings computed by earlier mlxcel versions differ from current ones and an index built with them should be re-embedded. The change has not been measured on these checkpoints against Sentence Transformers.
 
-`max_length` is the hard cap of 8192, below the checkpoint's declared 32768. Prompt prefixes, applied by the caller: `query: ` and `passage: `.
+`max_length` resolves to the default ceiling of 8192, below the checkpoint's declared 32768. Prompt prefixes, applied by the caller: `query: ` and `passage: `.
 
 ```sh
 mlxcel embed -m nvidia/Nemotron-3-Embed-1B-BF16 \
@@ -374,7 +374,7 @@ Pooling is CLS: the tokenizer's post-processor prepends `<|startoftext|>` and th
 
 The LFM2 and LFM2.5 ColBERT late-interaction checkpoints share this `model_type` and this architecture but project every token through a `1_Dense` module and emit one vector per token. They are rejected at load rather than served as a single pooled vector.
 
-`max_length` is 512 (`sentence_bert_config.json`), well under the hard cap. Prompt prefixes, applied by the caller: `query: ` and `document: `.
+`max_length` is 512 (`sentence_bert_config.json`), well under the 8192 default ceiling. Prompt prefixes, applied by the caller: `query: ` and `document: `.
 
 ```sh
 mlxcel embed -m LiquidAI/LFM2.5-Embedding-350M \
@@ -437,10 +437,10 @@ A mask is never built as `(1 - m) * C` with a finite `C` in the activation dtype
 
 | Flag | Env | Default | Meaning |
 |------|-----|---------|---------|
-| `-m <embedding checkpoint>` | `LLAMA_ARG_MODEL` | | Serves the checkpoint on `/v1/embeddings`; chat stays unloaded. |
+| `-m <embedding checkpoint>` | `LLAMA_ARG_MODEL` | | Serves the checkpoint on `/v1/embeddings`; on the MLX path the chat provider starts without a chat model, so no generation load is attempted. |
 | `--embedding-model <path or repo-id>` | `LLAMA_ARG_EMBEDDING_MODEL`, `MLXCEL_EMBEDDING_MODEL` | unset | A second checkpoint served on `/v1/embeddings` next to the chat model in `-m`. Resolved and auto-downloaded like `-m`. Combining it with an embedding checkpoint in `-m` is a startup error ("two embedding models"). A load failure of an explicit `--embedding-model` is a startup error; a load failure of an `-m` embedding checkpoint is logged and the route answers `501`. |
 | `--embedding-batch-size N` | `MLXCEL_EMBEDDING_BATCH_SIZE` | `16` | Texts per forward pass. |
-| `--embedding-max-length N` | `MLXCEL_EMBEDDING_MAX_LENGTH` | derived | Lowers the derived `max_length`. |
+| `--embedding-max-length N` | `MLXCEL_EMBEDDING_MAX_LENGTH` | derived (ceiling `8192`) | Upper bound on the derived `max_length`. A positive value replaces the `8192` ceiling. A larger override is still bounded by the checkpoint's `sentence_bert_config.json`, `processor_config.json` and `tokenizer_config.json` limits, and by `config.json` `max_position_embeddings` on absolute-position families; rotary-position families do not consult `max_position_embeddings`, so keep the value within it. A lower value lowers the result, and unset or `0` keeps `8192`. A larger limit costs memory in proportion to the longest input. |
 | `--embedding-queue-depth N` | `MLXCEL_EMBEDDING_QUEUE_DEPTH` | `8` | Bound on each embedding/reranking worker command queue; a full queue returns `503`. |
 | `--embedding-request-timeout-secs N` | `MLXCEL_EMBEDDING_REQUEST_TIMEOUT_SECS` | `120` | Per-request embedding/reranking reply timeout; `0` falls back to the default. |
 
@@ -456,6 +456,16 @@ mlxcel-server -m mlx-community/Qwen3-4B-4bit --embedding-model Qwen/Qwen3-Embedd
 curl -s localhost:8080/v1/embeddings -H 'Content-Type: application/json' \
   -d '{"input": ["The weather is lovely today.", "It is so sunny outside!", "He drove to the stadium."]}'
 ```
+
+### Embedding-only server, step by step
+
+On the MLX path, an embedding checkpoint in `-m` is detected before the chat provider is built, so the checkpoint is never offered to the generation loader. An `xla-iree` build with `MLXCEL_BACKEND=xla` returns before this check and still performs the OpenXLA startup load.
+
+1. Start the server with the checkpoint in `-m` and `--embedding`:
+   `mlxcel-server -m <embedding checkpoint> --embedding --port 8080`
+2. The startup log carries `Chat generation is disabled: <path> is served as an embedding model on /v1/embeddings, so the chat worker did not try to load it`. There is no `Failed to load model: ... is an embedding model ...` line, because no chat load is attempted.
+3. `POST /v1/embeddings` returns vectors for the checkpoint, and `/health` reports ready once the embedding worker is installed.
+4. `/v1/chat/completions` answers the chat-unavailable `501`; run a second server with a chat model in `-m` to serve chat.
 
 ## `mlxcel embed`
 

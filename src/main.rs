@@ -54,7 +54,7 @@ Environment Variables:
                            unset/\"max\", use MLX gpu_max_memory_size (default)
                            \"0\"/\"none\", disable the wired limit
                            \"96GB\", explicit limit (GB/G, MB/M, KB/K, or bytes)
-  MLXCEL_MEMORY_LIMIT    Soft MLX allocator memory cap (fails fast on overflow)
+  MLXCEL_MEMORY_LIMIT    Soft MLX allocator memory cap (a guideline on Metal, not a hard cap)
                            unset/\"0\"/\"none\", let MLX use its backend default (default)
                            \"32GB\", explicit limit (GB/G, MB/M, KB/K, or bytes)
   MLX_MAX_OPS_PER_BUFFER MLX command-buffer op cap (decode dispatch-gap lever)
@@ -1883,9 +1883,15 @@ pub(crate) struct ServeArgs {
 
     /// Token cap per embedding input (default: derived from the checkpoint)
     ///
-    /// Lowers the limit derived from `sentence_bert_config.json`,
-    /// `tokenizer_config.json` and `config.json` (hard cap 8192). Longer
-    /// inputs are truncated from the right, keeping a trailing special token.
+    /// Sets the ceiling of the limit derived from `sentence_bert_config.json`,
+    /// `processor_config.json`, `tokenizer_config.json` and, on
+    /// absolute-position families, `config.json` `max_position_embeddings`,
+    /// which is 8192 unless this is set. A positive value replaces 8192; a
+    /// smaller value lowers the result, and checkpoint limits still bound a
+    /// larger one. Rotary-position families do not consult
+    /// `max_position_embeddings`, so keep the value within it. Longer inputs
+    /// are truncated from the right, keeping a trailing special token. A larger
+    /// limit costs memory in proportion to the longest input.
     #[arg(long, env = "MLXCEL_EMBEDDING_MAX_LENGTH", value_name = "N")]
     embedding_max_length: Option<usize>,
 

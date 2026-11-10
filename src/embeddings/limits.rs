@@ -24,8 +24,9 @@ use crate::tokenizer::MlxcelTokenizer;
 
 use super::model::EmbeddingModel;
 
-/// Hard upper bound on the tokens one embedding input may carry, whatever
-/// the checkpoint declares.
+/// Default ceiling on the tokens one embedding input may carry. A positive
+/// `--embedding-max-length` replaces it; the checkpoint limits the family
+/// consults still apply as a lower bound.
 pub const EMBEDDING_MAX_LENGTH_CAP: usize = 8192;
 
 /// `tokenizer_config.json` `model_max_length` values at or above this are
@@ -79,17 +80,25 @@ pub fn is_absolute_position_family(model_type: ModelType) -> bool {
     )
 }
 
-/// `max_length` derivation: the smallest of `sentence_bert_config.json`
+/// `max_length` derivation: the smallest of the ceiling (the default `8192`,
+/// or a positive operator override in its place), `sentence_bert_config.json`
 /// `max_seq_length`, `processor_config.json` `max_length` or `p_max_length`,
 /// `tokenizer_config.json` `model_max_length` (when `0 < value < 1_000_000`),
-/// `config.json` `max_position_embeddings` for absolute-position encoders, the
-/// hard cap, and the operator override.
+/// `config.json` `max_position_embeddings` for absolute-position encoders, and
+/// the operator override. A positive override replaces the ceiling, raising it
+/// when larger, while a checkpoint limit still wins when it is lower;
+/// `max_position_embeddings` is the only candidate skipped for rotary-position
+/// families.
 pub fn derive_max_length(
     model_dir: &Path,
     is_absolute_position: bool,
     max_length_override: Option<usize>,
 ) -> usize {
-    let mut candidates: Vec<usize> = vec![EMBEDDING_MAX_LENGTH_CAP];
+    let mut candidates: Vec<usize> = vec![
+        max_length_override
+            .filter(|&v| v > 0)
+            .unwrap_or(EMBEDDING_MAX_LENGTH_CAP),
+    ];
 
     if let Some(v) = read_json(&model_dir.join("sentence_bert_config.json"))
         .and_then(|cfg| cfg.get("max_seq_length")?.as_u64())
