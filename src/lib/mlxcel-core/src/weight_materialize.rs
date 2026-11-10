@@ -26,9 +26,10 @@
 //! ([`crate::weights::load_weights_from_dir`] and the filtered and
 //! single-file variants built on [`crate::weights::load_safetensors_filtered`])
 //! register each tensor they hand out with the [`MaterializationScope`] open on
-//! the loading thread. The model-load entry points open a scope around family
-//! construction and [`MaterializationScope::finish`] it after the model is
-//! built, so every family inherits the policy without deciding for itself.
+//! the loading thread. The model-load entry points and the reranker loader
+//! open a scope around family construction and
+//! [`MaterializationScope::finish`] it after the model is built, so every
+//! family inherits the policy without deciding for itself.
 //! Loads outside a scope (pipeline stages, embedding loaders, tests) register
 //! nothing and stay lazy, exactly as before.
 //!

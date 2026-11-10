@@ -17,11 +17,14 @@
 //! Detection happens on `config.json` alone ([`super::detect_reranker_kind`]),
 //! so a checkpoint directory is enough; the shared batch-size and length
 //! overrides are applied here and each family owns its own tokenizer and
-//! weights.
+//! weights. The dispatch runs inside a
+//! [`mlxcel_core::weight_materialize::MaterializationScope`], so no family
+//! decides for itself when its weights are read.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use mlxcel_core::weight_materialize::{MaterializationPolicy, MaterializationScope};
 use serde_json::Value;
 
 use crate::embeddings::loader::read_embedding_config;
@@ -73,10 +76,29 @@ pub fn load_reranker(model_path: &Path) -> Result<LoadedReranker> {
 }
 
 /// Load a reranker checkpoint: detect the kind, then build its scoring path.
+///
+/// The weights follow `MLXCEL_WEIGHT_MATERIALIZATION` as a generation model's
+/// do: read and uploaded before this returns by default, at the first scoring
+/// call under `lazy`.
 pub fn load_reranker_with_options(
     model_path: &Path,
     options: RerankLoadOptions,
 ) -> Result<LoadedReranker> {
+    load_reranker_with_policy(model_path, options, MaterializationPolicy::from_env())
+}
+
+/// [`load_reranker_with_options`] under an explicit weight materialization
+/// policy.
+///
+/// The scope spans the kind dispatch, so every family's weights loader
+/// registers with it. It is finished after the family has returned and its
+/// weight maps are gone; a failed load drops it without evaluating anything.
+pub(crate) fn load_reranker_with_policy(
+    model_path: &Path,
+    options: RerankLoadOptions,
+    policy: MaterializationPolicy,
+) -> Result<LoadedReranker> {
+    let scope = MaterializationScope::begin_with(policy);
     let model_dir = resolve_model_dir(model_path);
     let config = read_embedding_config(&model_dir)?;
     let kind = detect_reranker_kind(&config)
@@ -103,6 +125,9 @@ pub fn load_reranker_with_options(
             options.max_length,
         )?),
     };
+    if let Some(report) = scope.finish() {
+        report.emit();
+    }
 
     let model_type = config
         .get("model_type")
