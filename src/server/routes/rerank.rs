@@ -28,6 +28,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::rerank::{ImageInput, RerankItem};
 use crate::server::AppState;
@@ -62,6 +63,7 @@ pub(crate) fn rerank_error_response(err: RerankError) -> ErrorResponse {
         RerankError::Timeout => {
             ErrorResponse::gateway_timeout("Rerank request timed out. Please try again later.")
         }
+        RerankError::Cancelled => ErrorResponse::client_closed_request(),
         RerankError::InvalidInput(message) => invalid_request(message),
         RerankError::Internal(message) => {
             ErrorResponse::internal_server_error(format!("rerank inference failed: {message}"))
@@ -239,11 +241,16 @@ pub async fn create_rerank(State(state): State<AppState>, Json(body): Json<Value
 
     let started = std::time::Instant::now();
     // The provider blocks on the worker's reply channel, so keep it off the
-    // async executor.
+    // async executor. Dropping this future does not stop a `spawn_blocking`
+    // closure, so the drop guard cancels the token to tell the worker that the
+    // client is gone.
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
     let worker_provider: Arc<dyn RerankModelProvider> = provider.clone();
-    let outcome =
-        tokio::task::spawn_blocking(move || worker_provider.rerank(query, documents, instruction))
-            .await;
+    let outcome = tokio::task::spawn_blocking(move || {
+        worker_provider.rerank(query, documents, instruction, cancel)
+    })
+    .await;
     let scored = match outcome {
         Ok(Ok(result)) => result,
         Ok(Err(err)) => return rerank_error_response(err).into_response(),

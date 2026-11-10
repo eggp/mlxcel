@@ -20,9 +20,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
 use super::{RerankWorker, RerankWorkerProvider};
 use crate::rerank::stub::{STUB_BATCH_SIZE, STUB_MAX_LENGTH, stub_loaded_reranker};
-use crate::rerank::{LoadedReranker, RerankItem, RerankScores, Reranker, RerankerKind};
+use crate::rerank::{
+    LoadedReranker, RerankAbandoned, RerankItem, RerankScores, Reranker, RerankerKind,
+};
 use crate::server::rerank_model::{RerankError, RerankModelProvider};
 
 fn provider() -> RerankWorkerProvider {
@@ -59,6 +63,7 @@ fn worker_round_trips_scores_on_its_own_thread() {
             query(),
             vec![RerankItem::text("alpha beta"), RerankItem::text("gamma")],
             None,
+            CancellationToken::new(),
         )
         .expect("scoring succeeds");
     assert_eq!(scored.scores.len(), 2);
@@ -73,7 +78,12 @@ fn worker_maps_a_family_error_to_internal() {
         image: image::DynamicImage::new_rgb8(4, 4),
     };
     let err = p
-        .rerank(query(), vec![RerankItem::image(image)], None)
+        .rerank(
+            query(),
+            vec![RerankItem::image(image)],
+            None,
+            CancellationToken::new(),
+        )
         .expect_err("the text-only stub rejects images");
     match err {
         RerankError::Internal(message) => {
@@ -102,11 +112,12 @@ impl Reranker for PanickingReranker {
         RerankerKind::GenerativeText
     }
 
-    fn score(
+    fn score_until(
         &self,
         _query: &RerankItem,
         documents: &[RerankItem],
         _instruction: Option<&str>,
+        _is_abandoned: &dyn Fn() -> bool,
     ) -> anyhow::Result<RerankScores> {
         if documents.iter().any(|d| d.text_or_empty() == "boom") {
             panic!("synthetic rerank panic");
@@ -145,7 +156,12 @@ fn worker_survives_a_panicking_request_and_keeps_serving() {
     .expect("worker spawns");
 
     let err = p
-        .rerank(query(), vec![RerankItem::text("boom")], None)
+        .rerank(
+            query(),
+            vec![RerankItem::text("boom")],
+            None,
+            CancellationToken::new(),
+        )
         .expect_err("the sentinel document panics inside the family");
     match err {
         RerankError::Internal(message) => {
@@ -156,7 +172,12 @@ fn worker_survives_a_panicking_request_and_keeps_serving() {
     }
 
     let scored = p
-        .rerank(query(), vec![RerankItem::text("fine")], None)
+        .rerank(
+            query(),
+            vec![RerankItem::text("fine")],
+            None,
+            CancellationToken::new(),
+        )
         .expect("the worker still serves after the panic");
     assert_eq!(scored.scores.len(), 1);
 }
@@ -169,11 +190,12 @@ impl Reranker for SlowReranker {
         RerankerKind::GenerativeText
     }
 
-    fn score(
+    fn score_until(
         &self,
         _query: &RerankItem,
         documents: &[RerankItem],
         _instruction: Option<&str>,
+        _is_abandoned: &dyn Fn() -> bool,
     ) -> anyhow::Result<RerankScores> {
         std::thread::sleep(self.0);
         Ok(RerankScores {
@@ -203,7 +225,12 @@ fn request_timeout_returns_timeout_error() {
         })
         .expect("worker spawns");
     let err = p
-        .rerank(query(), vec![RerankItem::text("alpha")], None)
+        .rerank(
+            query(),
+            vec![RerankItem::text("alpha")],
+            None,
+            CancellationToken::new(),
+        )
         .expect_err("slower than the timeout");
     assert!(matches!(err, RerankError::Timeout), "{err:?}");
 }
@@ -220,11 +247,12 @@ impl Reranker for BlockingReranker {
         RerankerKind::GenerativeText
     }
 
-    fn score(
+    fn score_until(
         &self,
         _query: &RerankItem,
         documents: &[RerankItem],
         _instruction: Option<&str>,
+        _is_abandoned: &dyn Fn() -> bool,
     ) -> anyhow::Result<RerankScores> {
         if let Some(gate) = self.gate.take() {
             let _ = self.started.send(());
@@ -272,13 +300,23 @@ fn queue_full_returns_queuefull_error() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            let _ = worker.score(query(), vec![RerankItem::text("a")], None);
+            let _ = worker.score(
+                query(),
+                vec![RerankItem::text("a")],
+                None,
+                CancellationToken::new(),
+            );
         });
         started_rx.recv().expect("in-flight request started");
 
         let mut saw_queue_full = false;
         for _ in 0..(queue_depth + 1) {
-            match worker.score(query(), vec![RerankItem::text("b")], None) {
+            match worker.score(
+                query(),
+                vec![RerankItem::text("b")],
+                None,
+                CancellationToken::new(),
+            ) {
                 Err(RerankError::QueueFull) => {
                     saw_queue_full = true;
                     break;
@@ -333,13 +371,18 @@ fn each_scoring_request_releases_the_cache_once() {
         .map(|i| RerankItem::text(format!("doc {i}")))
         .collect();
     worker
-        .score(query(), documents, None)
+        .score(query(), documents, None, CancellationToken::new())
         .expect("scoring succeeds");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 
     for _ in 0..3 {
         worker
-            .score(query(), vec![RerankItem::text("alpha")], None)
+            .score(
+                query(),
+                vec![RerankItem::text("alpha")],
+                None,
+                CancellationToken::new(),
+            )
             .expect("scoring succeeds");
     }
     assert_eq!(clears.load(Ordering::SeqCst), 4);
@@ -353,7 +396,12 @@ fn a_failed_scoring_request_still_releases_the_cache() {
         image: image::DynamicImage::new_rgb8(4, 4),
     };
     worker
-        .score(query(), vec![RerankItem::image(image)], None)
+        .score(
+            query(),
+            vec![RerankItem::image(image)],
+            None,
+            CancellationToken::new(),
+        )
         .expect_err("the text-only stub rejects images");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 }
@@ -362,7 +410,230 @@ fn a_failed_scoring_request_still_releases_the_cache() {
 fn a_panicking_scoring_request_still_releases_the_cache() {
     let (worker, clears) = counting_worker(|| Ok(panicking_loaded()));
     worker
-        .score(query(), vec![RerankItem::text("boom")], None)
+        .score(
+            query(),
+            vec![RerankItem::text("boom")],
+            None,
+            CancellationToken::new(),
+        )
         .expect_err("the sentinel document panics inside the family");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
+}
+
+/// Bounds every blocking receive of the cancellation tests, so a regression
+/// fails instead of hanging.
+const WAIT: Duration = Duration::from_secs(10);
+
+const GATED_BATCH_SIZE: usize = 2;
+
+/// A fake reranker that counts the micro-batches it scores and holds each one
+/// at a gate: it reports the batch index, then waits until the test releases
+/// the batch or drops the release sender.
+struct GatedBatchReranker {
+    batches_scored: Arc<AtomicUsize>,
+    batch_entered: mpsc::Sender<usize>,
+    batch_release: mpsc::Receiver<()>,
+}
+
+impl Reranker for GatedBatchReranker {
+    fn kind(&self) -> RerankerKind {
+        RerankerKind::GenerativeText
+    }
+
+    fn score_until(
+        &self,
+        _query: &RerankItem,
+        documents: &[RerankItem],
+        _instruction: Option<&str>,
+        is_abandoned: &dyn Fn() -> bool,
+    ) -> anyhow::Result<RerankScores> {
+        let mut scores = Vec::with_capacity(documents.len());
+        for (batch_idx, chunk) in documents.chunks(GATED_BATCH_SIZE).enumerate() {
+            if is_abandoned() {
+                anyhow::bail!(RerankAbandoned);
+            }
+            self.batches_scored.fetch_add(1, Ordering::SeqCst);
+            let _ = self.batch_entered.send(batch_idx);
+            let _ = self.batch_release.recv_timeout(WAIT);
+            for _ in chunk {
+                scores.push(1.0 / (scores.len() + 1) as f32);
+            }
+        }
+        Ok(RerankScores {
+            scores,
+            prompt_tokens: documents.len(),
+        })
+    }
+
+    fn max_length(&self) -> usize {
+        STUB_MAX_LENGTH
+    }
+
+    fn batch_size(&self) -> usize {
+        GATED_BATCH_SIZE
+    }
+}
+
+/// A worker over [`GatedBatchReranker`] with the test's ends of its channels.
+/// `batch_release` is declared first so it drops before the worker joins its
+/// thread, which may be waiting at the gate.
+struct GatedWorker {
+    batch_release: mpsc::Sender<()>,
+    batch_entered: mpsc::Receiver<usize>,
+    worker: RerankWorker,
+    batches_scored: Arc<AtomicUsize>,
+    clears: Arc<AtomicUsize>,
+}
+
+fn gated_worker(request_timeout: Duration) -> GatedWorker {
+    let (entered_tx, batch_entered) = mpsc::channel();
+    let (batch_release, release_rx) = mpsc::channel();
+    let batches_scored = Arc::new(AtomicUsize::new(0));
+    let batches = Arc::clone(&batches_scored);
+    let clears = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&clears);
+    let worker = RerankWorker::spawn_with_cache_clear(
+        "rerank-test-gated",
+        8,
+        request_timeout,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            Ok(LoadedReranker {
+                reranker: Box::new(GatedBatchReranker {
+                    batches_scored: batches,
+                    batch_entered: entered_tx,
+                    batch_release: release_rx,
+                }),
+                kind: RerankerKind::GenerativeText,
+                model_type: "gated".to_string(),
+            })
+        },
+    )
+    .expect("worker spawns");
+    GatedWorker {
+        batch_release,
+        batch_entered,
+        worker,
+        batches_scored,
+        clears,
+    }
+}
+
+fn numbered_documents(count: usize) -> Vec<RerankItem> {
+    (0..count)
+        .map(|i| RerankItem::text(format!("doc {i}")))
+        .collect()
+}
+
+#[test]
+fn queued_request_whose_caller_is_gone_scores_zero_batches() {
+    let gated = gated_worker(Duration::from_secs(30));
+    let worker = &gated.worker;
+    let release = gated.batch_release;
+
+    std::thread::scope(|scope| {
+        // The first request holds the worker at the gate of its only batch.
+        let first = scope.spawn(|| {
+            worker.score(
+                query(),
+                numbered_documents(1),
+                None,
+                CancellationToken::new(),
+            )
+        });
+        assert_eq!(gated.batch_entered.recv_timeout(WAIT), Ok(0));
+
+        // The second request (2 micro-batches) is cancelled before the worker
+        // can dequeue it. It is enqueued either behind the held first request
+        // or after it; the worker reaches it cancelled in both orders.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let second = scope.spawn(|| worker.score(query(), numbered_documents(4), None, cancel));
+
+        release.send(()).expect("the worker waits at the gate");
+        first
+            .join()
+            .expect("first caller joins")
+            .expect("the request whose caller waits is scored");
+        // A wrongly scored second request must not wait at the gate.
+        drop(release);
+        let err = second
+            .join()
+            .expect("second caller joins")
+            .expect_err("the cancelled request is skipped");
+        assert!(matches!(err, RerankError::Cancelled), "{err:?}");
+    });
+
+    assert_eq!(
+        gated.batches_scored.load(Ordering::SeqCst),
+        1,
+        "only the first request's batch is scored"
+    );
+    // The skipped request allocated no MLX buffers, so it releases no cache.
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn in_flight_request_stops_at_next_micro_batch_boundary_and_serves_next() {
+    let gated = gated_worker(Duration::from_secs(30));
+    let worker = &gated.worker;
+    let release = gated.batch_release;
+    let cancel = CancellationToken::new();
+
+    std::thread::scope(|scope| {
+        // 6 documents are 3 micro-batches.
+        let caller_cancel = cancel.clone();
+        let stopped =
+            scope.spawn(|| worker.score(query(), numbered_documents(6), None, caller_cancel));
+        assert_eq!(gated.batch_entered.recv_timeout(WAIT), Ok(0));
+
+        // Batch 0 is held at the gate, so the cancellation lands inside it;
+        // the release then lets batch 0 finish and reach the boundary check.
+        cancel.cancel();
+        release.send(()).expect("the worker waits at the gate");
+        let err = stopped
+            .join()
+            .expect("caller joins")
+            .expect_err("the request stops before batch 1");
+        assert!(matches!(err, RerankError::Cancelled), "{err:?}");
+    });
+    assert_eq!(
+        gated.batches_scored.load(Ordering::SeqCst),
+        1,
+        "batches 1 and 2 of the stopped request are not scored"
+    );
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 1);
+
+    // With the release sender gone the gate holds no batch, so the next
+    // request (2 micro-batches) runs straight through.
+    drop(release);
+    let live = worker
+        .score(
+            query(),
+            numbered_documents(4),
+            None,
+            CancellationToken::new(),
+        )
+        .expect("the worker serves the next request after a stopped one");
+    assert_eq!(live.scores, vec![1.0, 0.5, 1.0 / 3.0, 0.25]);
+    assert_eq!(gated.batches_scored.load(Ordering::SeqCst), 3);
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn reply_timeout_cancels_the_request_token() {
+    let gated = gated_worker(Duration::from_millis(50));
+    let cancel = CancellationToken::new();
+
+    // The gate is not released while the caller waits, so no reply can arrive
+    // and the timeout is the only outcome, however late the worker dequeues
+    // the request.
+    let err = gated
+        .worker
+        .score(query(), numbered_documents(1), None, cancel.clone())
+        .expect_err("no reply while the gate holds the batch");
+    assert!(matches!(err, RerankError::Timeout), "{err:?}");
+    assert!(cancel.is_cancelled());
 }

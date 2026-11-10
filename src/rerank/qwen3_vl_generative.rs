@@ -404,11 +404,12 @@ impl Reranker for Qwen3VlReranker {
         RerankerKind::GenerativeVl
     }
 
-    fn score(
+    fn score_until(
         &self,
         query: &RerankItem,
         documents: &[RerankItem],
         instruction: Option<&str>,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores> {
         let mut encoded = Vec::with_capacity(documents.len());
         for document in documents {
@@ -426,11 +427,17 @@ impl Reranker for Qwen3VlReranker {
                 text_indices.push(index);
                 continue;
             }
+            if is_abandoned() {
+                bail!(super::RerankAbandoned);
+            }
             let (row_scores, tokens) = self.score_rows(std::slice::from_ref(row), images)?;
             prompt_tokens += tokens;
             scores[index] = row_scores.first().copied();
         }
         for chunk in text_indices.chunks(self.batch_size) {
+            if is_abandoned() {
+                bail!(super::RerankAbandoned);
+            }
             let rows: Vec<EncodedRow> = chunk.iter().map(|&i| encoded[i].0.clone()).collect();
             let (chunk_scores, tokens) = self.score_rows(&rows, &[])?;
             prompt_tokens += tokens;

@@ -67,11 +67,12 @@ impl Reranker for StubReranker {
         self.kind
     }
 
-    fn score(
+    fn score_until(
         &self,
         query: &RerankItem,
         documents: &[RerankItem],
         _instruction: Option<&str>,
+        _is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores> {
         if !self.supports_images
             && (query.has_image() || documents.iter().any(RerankItem::has_image))

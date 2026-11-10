@@ -171,6 +171,13 @@ pub struct RerankScores {
     pub prompt_tokens: usize,
 }
 
+/// The error of a [`Reranker::score_until`] call that stopped because its
+/// caller no longer waits, as opposed to a scoring failure. Callers recognise
+/// it with `anyhow::Error::is::<RerankAbandoned>()`.
+#[derive(Debug, thiserror::Error)]
+#[error("rerank request abandoned")]
+pub struct RerankAbandoned;
+
 /// A loaded reranker.
 ///
 /// Implementors hold MLX array handles directly and are used from exactly one
@@ -188,6 +195,19 @@ pub trait Reranker {
         query: &RerankItem,
         documents: &[RerankItem],
         instruction: Option<&str>,
+    ) -> Result<RerankScores> {
+        self.score_until(query, documents, instruction, &|| false)
+    }
+
+    /// Score every document against `query`, stopping at the next micro-batch
+    /// boundary once `is_abandoned()` returns `true`. A call stopped this way
+    /// fails with [`RerankAbandoned`].
+    fn score_until(
+        &self,
+        query: &RerankItem,
+        documents: &[RerankItem],
+        instruction: Option<&str>,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores>;
 
     /// Whether image items are accepted.

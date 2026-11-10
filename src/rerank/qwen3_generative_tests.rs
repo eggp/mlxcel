@@ -388,3 +388,30 @@ fn rejects_image_items() {
         .expect_err("a text-only reranker rejects images");
     assert!(err.to_string().contains("text-only"), "{err}");
 }
+
+#[test]
+fn score_until_stops_between_micro_batches_when_abandoned() {
+    let _guard = mlx_test_guard();
+    let reranker = build(128, 2);
+    let documents = [
+        RerankItem::text("panda bear china"),
+        RerankItem::text("berlin germany"),
+        RerankItem::text("capital beijing"),
+        RerankItem::text("panda china"),
+    ];
+    let checks = std::cell::Cell::new(0usize);
+    let err = reranker
+        .score_until(
+            &RerankItem::text("what is panda?"),
+            &documents,
+            None,
+            &|| {
+                let n = checks.get();
+                checks.set(n + 1);
+                n >= 1
+            },
+        )
+        .expect_err("abandons before the second micro-batch");
+    assert!(err.is::<crate::rerank::RerankAbandoned>(), "{err}");
+    assert_eq!(checks.get(), 2, "checked before batch 0 and before batch 1");
+}

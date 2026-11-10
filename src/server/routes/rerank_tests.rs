@@ -47,6 +47,7 @@ impl RerankModelProvider for NonFiniteRerankProvider {
         _query: RerankItem,
         documents: Vec<RerankItem>,
         _instruction: Option<String>,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<RerankScores, RerankError> {
         Ok(RerankScores {
             scores: vec![f32::NAN; documents.len()],
@@ -537,6 +538,12 @@ fn provider_errors_map_to_the_shared_status_codes() {
         StatusCode::GATEWAY_TIMEOUT
     );
     assert_eq!(
+        rerank_error_response(RerankError::Cancelled)
+            .status
+            .as_u16(),
+        499
+    );
+    assert_eq!(
         rerank_error_response(RerankError::InvalidInput("bad".into())).status,
         StatusCode::BAD_REQUEST
     );
@@ -585,5 +592,132 @@ async fn non_finite_scores_return_500() {
             .expect("message")
             .contains("invalid numeric result"),
         "{body}"
+    );
+}
+
+#[tokio::test]
+async fn dropped_http_request_cancels_in_flight_worker_at_next_batch() {
+    use crate::rerank::{LoadedReranker, Reranker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Bounds every blocking receive, so a regression fails instead of hanging.
+    const GATE_WAIT: Duration = Duration::from_secs(10);
+
+    struct GatedBatchReranker {
+        batches: Arc<AtomicUsize>,
+        entered: mpsc::Sender<usize>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl Reranker for GatedBatchReranker {
+        fn kind(&self) -> RerankerKind {
+            RerankerKind::GenerativeText
+        }
+
+        fn score_until(
+            &self,
+            _query: &RerankItem,
+            documents: &[RerankItem],
+            _instruction: Option<&str>,
+            is_abandoned: &dyn Fn() -> bool,
+        ) -> anyhow::Result<RerankScores> {
+            let mut scores = Vec::with_capacity(documents.len());
+            for (batch_idx, chunk) in documents.chunks(2).enumerate() {
+                if is_abandoned() {
+                    anyhow::bail!(crate::rerank::RerankAbandoned);
+                }
+                self.batches.fetch_add(1, Ordering::SeqCst);
+                let _ = self.entered.send(batch_idx);
+                let _ = self.release.recv_timeout(GATE_WAIT);
+                scores.extend(std::iter::repeat_n(0.5, chunk.len()));
+            }
+            Ok(RerankScores {
+                scores,
+                prompt_tokens: documents.len(),
+            })
+        }
+
+        fn max_length(&self) -> usize {
+            64
+        }
+
+        fn batch_size(&self) -> usize {
+            2
+        }
+    }
+
+    let (entered_tx, entered_rx) = mpsc::channel::<usize>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let batches = Arc::new(AtomicUsize::new(0));
+    let batches_clone = Arc::clone(&batches);
+
+    let provider: Arc<dyn RerankModelProvider> = Arc::new(
+        RerankWorkerProvider::from_loader(
+            STUB_MODEL_ID.to_string(),
+            8,
+            Duration::from_secs(30),
+            move || {
+                Ok(LoadedReranker {
+                    reranker: Box::new(GatedBatchReranker {
+                        batches: batches_clone,
+                        entered: entered_tx,
+                        release: release_rx,
+                    }),
+                    kind: RerankerKind::GenerativeText,
+                    model_type: "gated".to_string(),
+                })
+            },
+        )
+        .expect("worker spawns"),
+    );
+
+    let app = app_with(Some(provider));
+
+    // Start a 6-document request (3 batches of 2) and drop the HTTP future
+    // while batch 0 is in flight.
+    let mut dropped_fut = Box::pin(
+        app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/rerank")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({
+                        "query": "alpha",
+                        "documents": ["d0", "d1", "d2", "d3", "d4", "d5"],
+                    })
+                    .to_string(),
+                ))
+                .expect("request builds"),
+        ),
+    );
+
+    // Poll the future until the worker enters batch 0.
+    tokio::select! {
+        _ = &mut dropped_fut => panic!("request must block on batch 0"),
+        idx = tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(GATE_WAIT).expect("entered batch 0")
+        }) => {
+            assert_eq!(idx.expect("join"), 0);
+        }
+    }
+
+    // A client that disconnects drops the handler future.
+    drop(dropped_fut);
+    // Close the gate so batch 0 finishes and any subsequent request does not block.
+    drop(release_tx);
+
+    let (status, body) = post(
+        app,
+        "/v1/rerank",
+        json!({"query": "alpha", "documents": ["live0", "live1"]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    assert_eq!(
+        batches.load(Ordering::SeqCst),
+        2,
+        "dropped HTTP request must stop after batch 0 (1 batch) plus 1 batch for the live request"
     );
 }

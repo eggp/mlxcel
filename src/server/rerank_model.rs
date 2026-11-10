@@ -22,6 +22,7 @@
 //! `None` and the route returns a structured `501 Not Implemented`.
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 pub use crate::rerank::{ImageInput, RerankItem, RerankScores, RerankerKind};
 
@@ -34,9 +35,15 @@ pub enum RerankError {
     #[error("rerank worker queue is full")]
     QueueFull,
     /// The worker did not reply within the per-request timeout. Routes map this
-    /// to `504`; the in-flight MLX work is not cancelled.
+    /// to `504`; a queued request is skipped and an in-flight one stops after
+    /// the current micro-batch.
     #[error("rerank request timed out")]
     Timeout,
+    /// The request's token was cancelled, so the worker skipped it in the
+    /// queue or stopped it at a micro-batch boundary. Routes map this to
+    /// `499`; the caller that cancelled is normally no longer there to read it.
+    #[error("rerank request cancelled")]
+    Cancelled,
     /// The request content is invalid (empty query or document, an image for a
     /// text-only reranker). Routes map this to `400 invalid_request_error`.
     #[error("{0}")]
@@ -52,11 +59,18 @@ pub enum RerankError {
 /// routes invoke it inside `spawn_blocking`.
 pub trait RerankModelProvider: Send + Sync {
     /// Score every document against `query`, in document order.
+    ///
+    /// `cancel` is the caller's way to say it no longer waits: once it is
+    /// cancelled, a request still queued is not scored and one being scored
+    /// stops at the next micro-batch boundary, both with
+    /// [`RerankError::Cancelled`]. The provider cancels it itself when the
+    /// reply times out. A caller that will not cancel passes a fresh token.
     fn rerank(
         &self,
         query: RerankItem,
         documents: Vec<RerankItem>,
         instruction: Option<String>,
+        cancel: CancellationToken,
     ) -> Result<RerankScores, RerankError>;
 
     /// Served model id, reported in responses and `/v1/models`.
