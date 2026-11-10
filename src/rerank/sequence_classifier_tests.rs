@@ -22,6 +22,10 @@
 //!
 //! Tokenizer-only, so nothing here builds an MLX array.
 
+use std::fs;
+
+use tempfile::TempDir;
+
 use super::*;
 use crate::embeddings::tokenize::{EncodeOptions, encode_pair_row};
 use crate::embeddings::tokenize_tests::{CLS, SEP, bert_like_tokenizer};
@@ -137,6 +141,35 @@ fn truncation_is_installed_on_the_tokenizer() {
         params.direction,
         tokenizers::TruncationDirection::Right,
         "both sides are truncated from the right, keeping their opening tokens"
+    );
+}
+
+#[test]
+fn reranker_max_length_is_bounded_by_the_shared_ceiling() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    // ModernBERT is rotary, so the weights impose no clamp of their own and
+    // the derived value is what the tokenizer would take.
+    assert_eq!(
+        derive_rerank_max_length(tmp.path(), false, Some(16384)),
+        RERANK_MAX_LENGTH_CAP,
+        "--max-length must not raise the shared 8192 ceiling"
+    );
+    assert_eq!(
+        derive_rerank_max_length(tmp.path(), false, Some(512)),
+        512,
+        "a lower override still lowers the derived limit"
+    );
+
+    fs::write(
+        tmp.path().join("sentence_bert_config.json"),
+        r#"{"max_seq_length": 4096}"#,
+    )
+    .expect("write sentence_bert_config.json");
+    assert_eq!(
+        derive_rerank_max_length(tmp.path(), false, Some(16384)),
+        4096,
+        "a lower checkpoint limit still wins"
     );
 }
 

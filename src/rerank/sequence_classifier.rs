@@ -46,7 +46,8 @@ use crate::models::modernbert_heads::ModernBertSequenceClassifier;
 use crate::tokenizer::{MlxcelTokenizer, load_tokenizer};
 
 use super::{
-    RerankItem, RerankScores, Reranker, RerankerKind, require_single_label, sigmoid_to_vec,
+    RERANK_MAX_LENGTH_CAP, RerankItem, RerankScores, Reranker, RerankerKind, require_single_label,
+    sigmoid_to_vec,
 };
 
 /// The two classifier trunks behind one scoring path.
@@ -130,6 +131,17 @@ fn with_longest_first_truncation(
     Ok(MlxcelTokenizer::HuggingFace(hf))
 }
 
+/// `max_length` for one query/document pair: [`derive_max_length`] bounded by
+/// [`RERANK_MAX_LENGTH_CAP`], so `mlxcel rerank --max-length` can only lower it.
+fn derive_rerank_max_length(
+    model_dir: &Path,
+    is_absolute_position: bool,
+    max_length_override: Option<usize>,
+) -> usize {
+    derive_max_length(model_dir, is_absolute_position, max_length_override)
+        .min(RERANK_MAX_LENGTH_CAP)
+}
+
 impl SequenceClassifierReranker {
     /// Load a `ForSequenceClassification` checkpoint from its directory.
     ///
@@ -152,7 +164,7 @@ impl SequenceClassifierReranker {
             })?,
         );
         let pad_token_id = resolve_pad_token_id(model_dir, &tokenizer);
-        let mut max_length = derive_max_length(
+        let mut max_length = derive_rerank_max_length(
             model_dir,
             matches!(backbone, ClassifierBackbone::Bert(_)),
             max_length_override,

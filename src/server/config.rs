@@ -880,8 +880,9 @@ pub struct ServerConfig {
     /// `--embedding-batch-size`: texts per embedding forward pass. See
     /// [`DEFAULT_EMBEDDING_BATCH_SIZE`].
     pub embedding_batch_size: usize,
-    /// `--embedding-max-length`: lowers the token cap derived from the
-    /// checkpoint. `None` keeps the derived value.
+    /// `--embedding-max-length`: ceiling for the token cap derived from the
+    /// checkpoint. A positive value replaces the `8192` default, unset or `0`
+    /// keeps it, and a checkpoint limit still applies as a lower bound.
     pub embedding_max_length: Option<usize>,
     /// Bound on the embedding worker command queue (admission control). See
     /// [`DEFAULT_EMBEDDING_QUEUE_DEPTH`].

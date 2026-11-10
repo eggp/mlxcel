@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::fs;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -19,6 +20,7 @@ use std::time::Duration;
 
 use mlxcel_core::generate::SamplingConfig;
 use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
+use tempfile::TempDir;
 
 use super::{
     AdmissionWaiter, ChatWorkerGoneError, DECODE_HANG_TIMEOUT, GenerateEvent, GenerationResult,
@@ -204,6 +206,90 @@ fn send_shutdown_signal_reports_closed_channel() {
 fn model_provider_relies_on_auto_traits_for_shared_state() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ModelProvider>();
+}
+
+fn checkpoint_with_config(config_json: &str) -> TempDir {
+    let dir = TempDir::new().expect("tempdir");
+    fs::write(dir.path().join("config.json"), config_json).expect("write config.json");
+    dir
+}
+
+fn provider_without_chat_model(
+    model_path: std::path::PathBuf,
+    config: &crate::server::ServerConfig,
+) -> ModelProvider {
+    ModelProvider::new_with_server_config(
+        model_path,
+        None,
+        config,
+        Arc::new(BatchMetrics::new()),
+        Arc::new(BatchObservability::new()),
+    )
+    .expect("a no-chat-model path must not need a chat load")
+}
+
+#[test]
+fn embedding_checkpoint_builds_a_provider_without_a_chat_worker() {
+    let checkpoint =
+        checkpoint_with_config(r#"{"model_type": "bert", "architectures": ["BertModel"]}"#);
+    let provider = provider_without_chat_model(
+        checkpoint.path().to_path_buf(),
+        &crate::server::ServerConfig::default(),
+    );
+
+    // The chat worker is spawned unnamed, so a named worker can only come from
+    // a no-chat branch; this name is passed only by the embedding branch, which
+    // returns before the generation loader's only caller in this constructor.
+    assert_eq!(
+        provider.worker_exit.worker_thread_name(),
+        Some("model-worker-embedding-only")
+    );
+    assert!(provider.is_chat_unavailable());
+    assert!(!provider.is_loaded());
+
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("the no-chat worker exits");
+    assert!(provider.worker_exit_observed());
+}
+
+#[test]
+fn reranker_only_checkpoint_still_builds_its_no_chat_provider() {
+    let checkpoint = TempDir::new().expect("tempdir");
+    let config = crate::server::ServerConfig {
+        reranker_model_path: Some(checkpoint.path().to_path_buf()),
+        ..crate::server::ServerConfig::default()
+    };
+    let provider = provider_without_chat_model(checkpoint.path().to_path_buf(), &config);
+
+    assert_eq!(
+        provider.worker_exit.worker_thread_name(),
+        Some("model-worker-rerank-only")
+    );
+    assert!(provider.is_chat_unavailable());
+
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("the no-chat worker exits");
+}
+
+#[test]
+fn nemotron_voicechat_checkpoint_still_builds_its_no_chat_provider() {
+    let checkpoint = checkpoint_with_config(r#"{"model_type": "nemotron_voicechat"}"#);
+    let provider = provider_without_chat_model(
+        checkpoint.path().to_path_buf(),
+        &crate::server::ServerConfig::default(),
+    );
+
+    assert_eq!(
+        provider.worker_exit.worker_thread_name(),
+        Some("model-worker-realtime-only")
+    );
+    assert!(provider.is_chat_unavailable());
+
+    provider
+        .shutdown_and_wait(Duration::from_secs(5))
+        .expect("the no-chat worker exits");
 }
 
 #[test]

@@ -658,9 +658,17 @@ struct WorkerExitState {
 pub struct WorkerExitObserver {
     state: Mutex<WorkerExitState>,
     condvar: Condvar,
+    /// The name the observed worker thread was spawned with. Test-only: the
+    /// returned handle is the watcher thread, whose name cannot carry it.
+    #[cfg(test)]
+    worker_thread_name: Option<String>,
 }
 
 impl WorkerExitObserver {
+    #[cfg(test)]
+    pub(crate) fn worker_thread_name(&self) -> Option<&str> {
+        self.worker_thread_name.as_deref()
+    }
     pub fn observed(&self) -> bool {
         self.state
             .lock()
@@ -732,6 +740,12 @@ pub enum WorkerShutdownError {
 pub(crate) fn observe_worker_exit(
     worker_handle: thread::JoinHandle<()>,
 ) -> (thread::JoinHandle<()>, Arc<WorkerExitObserver>) {
+    #[cfg(test)]
+    let observer = Arc::new(WorkerExitObserver {
+        worker_thread_name: worker_handle.thread().name().map(str::to_string),
+        ..WorkerExitObserver::default()
+    });
+    #[cfg(not(test))]
     let observer = Arc::new(WorkerExitObserver::default());
     let observer_for_thread = observer.clone();
     let watcher = thread::spawn(move || {
@@ -952,12 +966,37 @@ impl ModelProvider {
             );
         }
 
+        // An embedding checkpoint has no chat surface: its embedding worker
+        // owns the weights and serves `/v1/embeddings`. The generation loader
+        // rejects every embedding variant, so without this branch the chat
+        // worker would only log a load failure before settling into the same
+        // no-chat state.
+        let detected_model_type = crate::models::get_model_type(&model_path);
+        if detected_model_type
+            .as_ref()
+            .is_ok_and(|&model_type| crate::model_metadata::is_embedding_model_type(model_type))
+        {
+            let reason = format!(
+                "Chat generation is disabled: {} is served as an embedding model on \
+                 /v1/embeddings, so the chat worker did not try to load it",
+                model_path.display()
+            );
+            return Self::new_without_chat_model(
+                model_path,
+                "model-worker-embedding-only",
+                reason,
+                batch_metrics,
+                batch_observability,
+                decode_hang_timeout,
+            );
+        }
+
         // Nemotron VoiceChat (#1376) has no chat or completions surface; the
         // realtime engine thread (`server/realtime_engine.rs`) owns the only
         // copy of its weights and serves `/v1/realtime`. Starting the chat
         // worker would load the 11B checkpoint a second time for nothing.
         if matches!(
-            crate::models::get_model_type(&model_path),
+            detected_model_type,
             Ok(crate::models::ModelType::NemotronVoiceChat)
         ) {
             let reason = format!(
@@ -1092,14 +1131,15 @@ impl ModelProvider {
     /// Build a provider whose chat worker never loads a model.
     ///
     /// Used when `-m` names the checkpoint `--reranker-model` already owns
-    /// (#1356), so the reranker worker keeps the only copy of those weights,
-    /// and for a Nemotron VoiceChat checkpoint, whose realtime engine owns
-    /// them (#1376). `reason` is logged once when the worker exits.
+    /// (#1356), so the reranker worker keeps the only copy of those weights;
+    /// for a Nemotron VoiceChat checkpoint, whose realtime engine owns them
+    /// (#1376); and for an embedding checkpoint, whose embedding worker owns
+    /// them. `reason` is logged once when the worker exits.
     /// The worker thread starts, logs why chat is unavailable and exits, which
     /// drops the request receiver and records a terminal no-chat state. Failed
-    /// chat loads record the same state (`-m <embedding checkpoint>` reaches
-    /// it too), so generation routes return a structured capability error while
-    /// `/health` keeps its existing `loading model` behavior.
+    /// chat loads record the same state, so generation routes return a
+    /// structured capability error while `/health` keeps its existing
+    /// `loading model` behavior.
     fn new_without_chat_model(
         model_path: PathBuf,
         thread_name: &str,

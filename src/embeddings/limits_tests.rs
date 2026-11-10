@@ -79,3 +79,53 @@ fn derive_max_length_takes_minimum_across_processor_and_tokenizer_configs() {
     assert_eq!(derive_max_length(tmp.path(), false, None), 2048);
     assert_eq!(derive_max_length(tmp.path(), false, Some(512)), 512);
 }
+
+#[test]
+fn derive_max_length_positive_override_raises_the_cap() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    assert_eq!(derive_max_length(tmp.path(), false, Some(32768)), 32768);
+}
+
+#[test]
+fn derive_max_length_keeps_a_checkpoint_limit_below_a_positive_override() {
+    let tmp = TempDir::new().expect("tempdir");
+    fs::write(
+        tmp.path().join("sentence_bert_config.json"),
+        r#"{"max_seq_length": 4096}"#,
+    )
+    .expect("write sentence_bert_config.json");
+
+    assert_eq!(derive_max_length(tmp.path(), false, Some(32768)), 4096);
+}
+
+#[test]
+fn derive_max_length_unset_or_zero_override_keeps_the_cap() {
+    let tmp = TempDir::new().expect("tempdir");
+
+    assert_eq!(
+        derive_max_length(tmp.path(), false, None),
+        EMBEDDING_MAX_LENGTH_CAP
+    );
+    assert_eq!(
+        derive_max_length(tmp.path(), false, Some(0)),
+        EMBEDDING_MAX_LENGTH_CAP
+    );
+}
+
+#[test]
+fn derive_max_length_override_below_the_checkpoint_limits_still_lowers() {
+    let tmp = TempDir::new().expect("tempdir");
+    fs::write(
+        tmp.path().join("processor_config.json"),
+        r#"{"max_length": 4096}"#,
+    )
+    .expect("write processor_config.json");
+    fs::write(
+        tmp.path().join("tokenizer_config.json"),
+        r#"{"model_max_length": 2048}"#,
+    )
+    .expect("write tokenizer_config.json");
+
+    assert_eq!(derive_max_length(tmp.path(), false, Some(512)), 512);
+}
