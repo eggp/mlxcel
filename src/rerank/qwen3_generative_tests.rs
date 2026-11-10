@@ -23,14 +23,20 @@
 //! Everything runs on a synthetic 2-layer backbone and a word-level
 //! tokenizer, so no checkpoint is needed; the real-checkpoint gate lives in
 //! `real_checkpoint_tests.rs`.
+//!
+//! The last two tests write that backbone to a checkpoint directory and load
+//! it through `load_reranker`, to pin when the load reads the weights.
 
 use mlxcel_core::utils::slice_axis;
 use mlxcel_core::weights::WeightMap;
 
 use super::*;
 use crate::embeddings::tokenize::{EncodedBatch, EncodedRow, PaddingSide};
-use crate::models::embedding_test_support::{Rng, ids_array, mlx_test_guard, to_vec};
+use crate::models::embedding_test_support::{
+    Rng, ids_array, max_abs_diff, mlx_test_guard, to_vec, write_f32_safetensors,
+};
 use crate::models::qwen3::ModelArgs;
+use crate::rerank::{LoadedReranker, RerankLoadOptions, load_reranker_with_options};
 
 const HIDDEN: usize = 16;
 const INTERMEDIATE: usize = 32;
@@ -65,7 +71,12 @@ fn tiny_args() -> ModelArgs {
 
 /// Deterministic dense weights in the sanitized Qwen3 key layout.
 fn tiny_weights(args: &ModelArgs) -> WeightMap {
-    let mut rng = Rng::new(0x1356_0BAD_F00D);
+    tiny_weights_seeded(args, 0x1356_0BAD_F00D)
+}
+
+/// [`tiny_weights`] drawn from `seed`, for two checkpoints that score apart.
+fn tiny_weights_seeded(args: &ModelArgs, seed: u64) -> WeightMap {
+    let mut rng = Rng::new(seed);
     let mut w = WeightMap::new();
     let h = args.hidden_size as i32;
     let hd = args.head_dim as i32;
@@ -113,6 +124,14 @@ fn tiny_weights(args: &ModelArgs) -> WeightMap {
 /// markers are added tokens so the prompt scaffold encodes to a stable, small
 /// number of ids without a real BPE vocabulary.
 fn qwen_like_tokenizer(extra_added: Option<&str>) -> crate::tokenizer::MlxcelTokenizer {
+    let json = qwen_like_tokenizer_json(extra_added);
+    let tokenizer =
+        tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("qwen-like tokenizer parses");
+    crate::tokenizer::MlxcelTokenizer::HuggingFace(tokenizer)
+}
+
+/// The `tokenizer.json` text behind [`qwen_like_tokenizer`].
+fn qwen_like_tokenizer_json(extra_added: Option<&str>) -> String {
     let mut added = vec![
         r#"{"id": 0, "content": "<|endoftext|>", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}"#.to_string(),
         r#"{"id": 1, "content": "<|im_start|>", "special": true, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}"#.to_string(),
@@ -125,7 +144,7 @@ fn qwen_like_tokenizer(extra_added: Option<&str>) -> crate::tokenizer::MlxcelTok
             r#"{{"id": 9, "content": "{content}", "special": false, "single_word": false, "lstrip": false, "rstrip": false, "normalized": false}}"#
         ));
     }
-    let json = format!(
+    format!(
         r#"{{
         "version": "1.0",
         "truncation": null,
@@ -147,10 +166,7 @@ fn qwen_like_tokenizer(extra_added: Option<&str>) -> crate::tokenizer::MlxcelTok
         }}
     }}"#,
         added.join(", ")
-    );
-    let tokenizer =
-        tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("qwen-like tokenizer parses");
-    crate::tokenizer::MlxcelTokenizer::HuggingFace(tokenizer)
+    )
 }
 
 /// Build a reranker over the synthetic backbone.
@@ -387,4 +403,154 @@ fn rejects_image_items() {
         )
         .expect_err("a text-only reranker rejects images");
     assert!(err.to_string().contains("text-only"), "{err}");
+}
+
+const CHECKPOINT_SEED: u64 = 0x1356_0BAD_F00D;
+const REWRITTEN_SEED: u64 = 0x0DD_C0FF_EE11;
+
+/// The tensors of a synthetic checkpoint, in the safetensors writer's shape.
+fn checkpoint_tensors(seed: u64) -> Vec<(String, Vec<i32>, Vec<f32>)> {
+    tiny_weights_seeded(&tiny_args(), seed)
+        .iter()
+        .map(|(name, array)| (name.clone(), mlxcel_core::array_shape(array), to_vec(array)))
+        .collect()
+}
+
+/// Write a checkpoint directory `load_reranker` accepts as a Qwen3 reranker.
+fn write_checkpoint(dir: &std::path::Path, seed: u64) {
+    let args = tiny_args();
+    let config = serde_json::json!({
+        "model_type": args.model_type,
+        "architectures": ["Qwen3ForCausalLM"],
+        "hidden_size": args.hidden_size,
+        "num_hidden_layers": args.num_hidden_layers,
+        "intermediate_size": args.intermediate_size,
+        "num_attention_heads": args.num_attention_heads,
+        "num_key_value_heads": args.num_key_value_heads,
+        "head_dim": args.head_dim,
+        "rms_norm_eps": args.rms_norm_eps,
+        "vocab_size": args.vocab_size,
+        "max_position_embeddings": args.max_position_embeddings,
+        "rope_theta": args.rope_theta,
+        "tie_word_embeddings": args.tie_word_embeddings,
+    });
+    std::fs::write(dir.join("config.json"), config.to_string()).expect("config written");
+    std::fs::write(dir.join("tokenizer.json"), qwen_like_tokenizer_json(None))
+        .expect("tokenizer written");
+    write_f32_safetensors(&dir.join("model.safetensors"), &checkpoint_tensors(seed));
+}
+
+/// Replace the tensor values of a written checkpoint without replacing the
+/// file, so a tensor that is read from it after this call gets the new values.
+fn rewrite_checkpoint_values(dir: &std::path::Path, seed: u64) {
+    use std::io::Write;
+
+    let staging = tempfile::tempdir().expect("tempdir");
+    let staged = staging.path().join("model.safetensors");
+    write_f32_safetensors(&staged, &checkpoint_tensors(seed));
+    let bytes = std::fs::read(&staged).expect("staged checkpoint reads");
+    let path = dir.join("model.safetensors");
+    assert_eq!(
+        bytes.len() as u64,
+        std::fs::metadata(&path).expect("checkpoint exists").len(),
+        "the rewrite must keep the file layout"
+    );
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("checkpoint opens for writing");
+    file.write_all(&bytes).expect("checkpoint rewritten");
+    file.sync_all().expect("checkpoint synced");
+}
+
+fn score_fixed_request(loaded: &LoadedReranker) -> Vec<f32> {
+    loaded
+        .reranker
+        .score(
+            &RerankItem::text("what is panda?"),
+            &[
+                RerankItem::text("panda bear china"),
+                RerankItem::text("berlin germany"),
+            ],
+            None,
+        )
+        .expect("scoring succeeds")
+        .scores
+}
+
+/// Scores around a checkpoint rewrite.
+struct RewriteScores {
+    /// A reranker loaded from the original checkpoint and scored at once.
+    original: Vec<f32>,
+    /// A reranker loaded by `load` from the original checkpoint, but scored
+    /// only after the file was rewritten.
+    held_across_rewrite: Vec<f32>,
+    /// A reranker loaded from the rewritten checkpoint.
+    rewritten: Vec<f32>,
+}
+
+/// Load with `load`, rewrite the checkpoint under the loaded reranker, then
+/// score. Whether the load read the weights shows in which checkpoint the
+/// held reranker scores like.
+fn scores_around_a_rewrite(
+    load: impl Fn(&std::path::Path) -> anyhow::Result<LoadedReranker>,
+) -> RewriteScores {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_checkpoint(dir.path(), CHECKPOINT_SEED);
+    let default_load =
+        |path: &std::path::Path| load_reranker_with_options(path, RerankLoadOptions::default());
+
+    let original = score_fixed_request(&default_load(dir.path()).expect("checkpoint loads"));
+    let held = load(dir.path()).expect("checkpoint loads");
+    rewrite_checkpoint_values(dir.path(), REWRITTEN_SEED);
+    let held_across_rewrite = score_fixed_request(&held);
+    let rewritten = score_fixed_request(&default_load(dir.path()).expect("checkpoint loads"));
+    assert!(
+        max_abs_diff(&original, &rewritten) > 1e-3,
+        "the two checkpoints must score apart for the comparison to mean anything: \
+         {original:?} against {rewritten:?}"
+    );
+    RewriteScores {
+        original,
+        held_across_rewrite,
+        rewritten,
+    }
+}
+
+#[test]
+fn load_reads_the_weights_before_it_returns() {
+    let _guard = mlx_test_guard();
+    let scores = scores_around_a_rewrite(|path| {
+        load_reranker_with_options(path, RerankLoadOptions::default())
+    });
+    assert!(
+        max_abs_diff(&scores.held_across_rewrite, &scores.original) < 1e-6,
+        "the first scoring call read the checkpoint: scores {:?} follow the rewritten file \
+         ({:?}) instead of the one that was loaded ({:?})",
+        scores.held_across_rewrite,
+        scores.rewritten,
+        scores.original
+    );
+}
+
+#[test]
+fn lazy_policy_leaves_the_weights_to_the_first_scoring_call() {
+    use mlxcel_core::weight_materialize::MaterializationPolicy;
+
+    let _guard = mlx_test_guard();
+    let scores = scores_around_a_rewrite(|path| {
+        crate::rerank::loader::load_reranker_with_policy(
+            path,
+            RerankLoadOptions::default(),
+            MaterializationPolicy::Lazy,
+        )
+    });
+    assert!(
+        max_abs_diff(&scores.held_across_rewrite, &scores.rewritten) < 1e-6,
+        "a lazy load read the checkpoint before the first scoring call: scores {:?} follow \
+         the file that was loaded ({:?}) instead of the rewritten one ({:?})",
+        scores.held_across_rewrite,
+        scores.original,
+        scores.rewritten
+    );
 }
