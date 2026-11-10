@@ -30,12 +30,15 @@ pub(crate) fn applied_wired_limit() -> u64 {
 const RUNTIME_DEVICE_ENV: &str = "MLXCEL_DEVICE";
 const WIRED_LIMIT_ENV: &str = "MLXCEL_WIRED_LIMIT";
 /// Issue #55: optional soft cap on the MLX allocator. When set, the
-/// runtime calls `mlxcel_core::memory::set_memory_limit(...)` at startup
-/// so MLX raises an exception once allocations would push the working
-/// set past this value, instead of thrashing or OOM-killing the process.
-/// Used by the future preflight capstone (#56). Accepts the shared size
-/// grammar of [`parse_memory_size`]: plain bytes, `NK`/`NKB`, `NM`/`NMB`
-/// or `NG`/`NGB`. Unset means "do not override MLX's default limit".
+/// runtime calls `mlxcel_core::memory::set_memory_limit(...)` at startup.
+/// On Metal this is a guideline for graph evaluation, not a hard cap:
+/// at or near it MLX releases cached buffers and makes evaluation wait for
+/// running work, allocations still succeed above it while the host has
+/// memory, and MLX raises an exception once the host is also out of
+/// RAM (including swap). Used by the future preflight capstone (#56).
+/// Accepts the shared size grammar of [`parse_memory_size`]: plain bytes,
+/// `NK`/`NKB`, `NM`/`NMB` or `NG`/`NGB`. Unset means "do not override
+/// MLX's default limit".
 const MEMORY_LIMIT_ENV: &str = "MLXCEL_MEMORY_LIMIT";
 /// Issue #627: optional bound on MLX's buffer cache. When set, the runtime
 /// calls `mlxcel_core::memory::set_cache_limit(...)` at startup so the CUDA
@@ -357,9 +360,12 @@ fn resolve_wired_limit() -> Option<usize> {
 ///
 /// Returns the limit actually applied to MLX, or `None` when the env var
 /// is unset / explicitly disabled. This is the hook the capstone preflight
-/// (#56) drives when a model is too large to fit comfortably — calling
-/// `mlxcel_core::memory::set_memory_limit` makes MLX raise an exception
-/// during evaluation instead of thrashing the system allocator.
+/// (#56) drives when a model is too large to fit comfortably. On Metal the
+/// limit set through `mlxcel_core::memory::set_memory_limit` is a guideline
+/// for graph evaluation rather than a hard cap: reaching it releases cached
+/// buffers and makes evaluation wait for running work, allocations still
+/// succeed above it while the host has memory, and an MLX exception comes
+/// once the host is also out of RAM (including swap).
 fn resolve_memory_limit() -> Option<usize> {
     let raw = std::env::var(MEMORY_LIMIT_ENV).ok();
     let bytes = match raw.as_deref() {

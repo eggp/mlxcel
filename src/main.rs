@@ -54,7 +54,7 @@ Environment Variables:
                            unset/\"max\", use MLX gpu_max_memory_size (default)
                            \"0\"/\"none\", disable the wired limit
                            \"96GB\", explicit limit (GB/G, MB/M, KB/K, or bytes)
-  MLXCEL_MEMORY_LIMIT    Soft MLX allocator memory cap (fails fast on overflow)
+  MLXCEL_MEMORY_LIMIT    Soft MLX allocator memory cap (a guideline on Metal, not a hard cap)
                            unset/\"0\"/\"none\", let MLX use its backend default (default)
                            \"32GB\", explicit limit (GB/G, MB/M, KB/K, or bytes)
   MLX_MAX_OPS_PER_BUFFER MLX command-buffer op cap (decode dispatch-gap lever)

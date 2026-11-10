@@ -4457,7 +4457,7 @@ pub use command_buffer_budget::DecodeCommandBufferBudget;
 
 // Typed wrappers around MLX's runtime memory accounting APIs (issue #55).
 // Public so that the CLI generate path can surface post-load resident
-// memory and the preflight (#56) can call `set_memory_limit` to fail fast.
+// memory and the preflight (#56) can call `set_memory_limit`.
 pub mod memory;
 
 // What macOS can give right now, the reserve left for it, and the process
