@@ -26,10 +26,13 @@ Run with:
 """
 
 import base64
+import contextlib
+import io
 import json
 import os
 import pathlib
 import platform
+import shlex
 import struct
 import sys
 import threading
@@ -64,11 +67,43 @@ hold = int(mode.split("-")[1]) if mode.startswith("hold-") else None
 worker = threading.Lock()
 lock = threading.Lock()
 served = [0]
+state = os.environ["STUB_IOREG_STATE"]
 
 
 def note(text):
     with open(os.environ["MLXCEL_STUB_LOG"], "a") as log:
         log.write(text + "\n")
+
+
+def put(name, text):
+    """Replace a file of the stub state directory in one step, so a reader
+    never sees it half written."""
+    with open(os.path.join(state, name + ".tmp"), "w") as fh:
+        fh.write(text)
+    os.replace(os.path.join(state, name + ".tmp"), os.path.join(state, name))
+
+
+def read_state(name):
+    try:
+        with open(os.path.join(state, name)) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def busy_until_seen(nth):
+    """Under "busy-footprint", hold request `nth` until a footprint reading
+    has seen it in flight, see ToolTestCase.footprint_seen_while_busy."""
+    put("busy", str(nth))
+    deadline = time.monotonic() + 10
+    while read_state("seen") != str(nth) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    os.remove(os.path.join(state, "busy"))
+
+
+# The stub `ioreg` reports GPU time in proportion to the requests counted here,
+# written before any reply, so a reading after a response counts its request.
+put("served", "0")
 
 
 def vector(text):
@@ -101,8 +136,11 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             served[0] += 1
             nth = served[0]
+            put("served", str(nth))
         if mode == "dies-on-2" and nth == 2:
             os._exit(7)
+        if mode == "busy-footprint":
+            busy_until_seen(nth)
         if mode == "status-500" or (mode == "second-fails" and nth > 1):
             return self.reply(500, {"error": texts[0]})
         if mode == "bad-response":
@@ -220,8 +258,18 @@ class ReplayTest(ToolTestCase):
         self.assert_footprint(run["footprint_lifetime_max_bytes"])
         # The stub lists four clients of the server, one without `AppUsage`
         # and one with an empty one, and clients of other processes.
-        self.assertEqual(run["gpu_time_ns"], rerank_tests.STUB_GPU_TIME_NS)
+        self.assertEqual(run["gpu_time_ns"], 4 * rerank_tests.STUB_GPU_TIME_NS_PER_REQUEST)
         self.assertEqual(run["gpu_time_source"], "ioreg")
+
+    def test_footprint_peak_is_sampled_while_the_request_is_in_flight(self):
+        with self.footprint_seen_while_busy():
+            code, _, _, result = self.run_tool("replay", stub_mode="busy-footprint")
+        self.assertEqual(code, 0)
+        for row in result["requests"]:
+            self.assertEqual(
+                (row["footprint_peak_bytes"], row["footprint_retained_bytes"]),
+                (rerank_tests.FOOTPRINT_BUSY, rerank_tests.FOOTPRINT_IDLE),
+            )
 
     def test_unreadable_gpu_time_is_null_with_the_reason_and_the_run_completes(self):
         for how, source in rerank_tests.GPU_TIME_FAILURES.items():
@@ -337,7 +385,9 @@ class ConcurrentTest(ToolTestCase):
         self.assertEqual([row["status"] for row in rows], [200] * 4)
         self.assertEqual([row["in_flight"] for row in rows], [2] * 4)
         self.assertEqual(components(rows[2]["vectors"][1]), (41, 1, 0, -2))
-        self.assertEqual(result["run"]["gpu_time_ns"], rerank_tests.STUB_GPU_TIME_NS)
+        self.assertEqual(
+            result["run"]["gpu_time_ns"], 4 * rerank_tests.STUB_GPU_TIME_NS_PER_REQUEST
+        )
 
 
 class StartupTest(ToolTestCase):
@@ -403,7 +453,9 @@ class AbandonTest(ToolTestCase):
              run["probe_texts"], run["large_requests"], run["in_flight"]),
             ("abandon", 0.05, 3, 4, 1, 2, 1),
         )
-        self.assertEqual(run["gpu_time_ns"], rerank_tests.STUB_GPU_TIME_NS)
+        # Four requests per large request: the probe alone, the large request,
+        # the probe behind it and one more probe.
+        self.assertEqual(run["gpu_time_ns"], 8 * rerank_tests.STUB_GPU_TIME_NS_PER_REQUEST)
         self.assertEqual(run["gpu_time_source"], "ioreg")
         self.assertIn("2 large requests: 2 abandoned, 0 not abandoned", stdout)
         self.assert_no_request_text(self.out.read_text(encoding="utf-8"), stdout, stderr)
@@ -565,6 +617,25 @@ class SafetyTest(ToolTestCase):
         self.assertEqual(log[0], "/v1/embeddings")
         self.assertLess(log.index("send"), log.index("seen dead"), log)
         self.assertEqual(len(refused), 2)
+
+
+class PortOptionTest(ToolTestCase):
+    def test_port_outside_1_to_65535_is_refused_before_anything_runs(self):
+        for port in ("0", "-1", "65536", "70000"):
+            with self.subTest(port=port):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                    ber.main(
+                        ["replay", "--bin", sys.executable,
+                         f"--server-args={shlex.quote(self.stub.as_posix())} ok",
+                         f"--port={port}", "--requests", str(self.requests),
+                         "--out", str(self.out), "--commit", "abc12345", "--live-traffic", "no"]
+                    )
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn("--port", stderr.getvalue())
+                self.assertIn("must be in the range 1 to 65535", stderr.getvalue())
+                self.assertEqual(self.started, [])
+                self.assertFalse(self.out.exists())
 
 
 class RequestFileTest(ToolTestCase):

@@ -400,7 +400,7 @@ scripts/bench_embed_replay.py compare --before ~/private/embed-replay-base.json 
     --after ~/private/embed-replay-fix.json
 ```
 
-Every measuring run prints one line per request, `id=<id> texts=<n> status=<status> wall_ms=...` (under `abandon`, one line per large request), and ends with `N of M requests embedded, F failed` (under `abandon`, `N large requests: A abandoned, B not abandoned, F with a failed probe`) and the path it wrote.
+`replay` and `concurrent` print one line per request, `id=<id> texts=<n> status=<status> wall_ms=...`, and end with `N of M requests embedded, F failed`. `abandon` prints one line per large request, `id=<id> texts=<n> abandoned_after_ms=... alone_ms=...` (`abandoned=no` in place of the delay when the server answered first), and ends with `N large requests: A abandoned, B not abandoned, F with a failed probe`. `startup` prints one line per start, `start=<n> first_ms=... status=... second_ms=... status=... before_mib=... after_first_mib=...`, and no summary line. Each then prints the path it wrote.
 
 ### Reading a result file
 

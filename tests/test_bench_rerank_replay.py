@@ -68,11 +68,43 @@ hold = int(mode.split("-")[1]) if mode.startswith("hold-") else None
 worker = threading.Lock()
 lock = threading.Lock()
 served = [0]
+state = os.environ["STUB_IOREG_STATE"]
 
 
 def note(text):
     with open(os.environ["MLXCEL_STUB_LOG"], "a") as log:
         log.write(text + "\n")
+
+
+def put(name, text):
+    """Replace a file of the stub state directory in one step, so a reader
+    never sees it half written."""
+    with open(os.path.join(state, name + ".tmp"), "w") as fh:
+        fh.write(text)
+    os.replace(os.path.join(state, name + ".tmp"), os.path.join(state, name))
+
+
+def read_state(name):
+    try:
+        with open(os.path.join(state, name)) as fh:
+            return fh.read()
+    except FileNotFoundError:
+        return None
+
+
+def busy_until_seen(nth):
+    """Under "busy-footprint", hold request `nth` until a footprint reading
+    has seen it in flight, see ToolTestCase.footprint_seen_while_busy."""
+    put("busy", str(nth))
+    deadline = time.monotonic() + 10
+    while read_state("seen") != str(nth) and time.monotonic() < deadline:
+        time.sleep(0.005)
+    os.remove(os.path.join(state, "busy"))
+
+
+# The stub `ioreg` reports GPU time in proportion to the requests counted here,
+# written before any reply, so a reading after a response counts its request.
+put("served", "0")
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -95,8 +127,11 @@ class Handler(BaseHTTPRequestHandler):
         with lock:
             served[0] += 1
             nth = served[0]
+            put("served", str(nth))
         if mode == "dies-on-2" and nth == 2:
             os._exit(7)
+        if mode == "busy-footprint":
+            busy_until_seen(nth)
         if mode == "status-500" or (mode == "second-fails" and nth > 1):
             return self.reply(500, {"error": request["query"]})
         if mode == "bad-response":
@@ -161,12 +196,14 @@ ON_MACOS = sys.platform == "darwin"
 
 # Stands in for `ioreg -r -w 0 -c AGXDeviceUserClient`, in the layout the real
 # command prints. In the directory STUB_IOREG_STATE names it reads the started
-# server's pid from `server.pid` and what to do from `mode` ("ok" when absent,
-# "no-client" or "fails"), and counts its calls in `calls`. Under "ok" the
-# server owns four clients: one with two usage entries, one with an empty
-# usage list, one without any, and one more with usage, 1500 ns per call plus
-# 7 in all, so a run, which reads twice, records 1500 ns. Clients of two other
-# processes, one whose pid begins with the server's, are listed in every mode.
+# server's pid from `server.pid`, what to do from `mode` ("ok" when absent,
+# "no-client" or "fails"), and from `served` how many requests the stub server
+# has received so far. Under "ok" the server owns four clients: one with two
+# usage entries, one with an empty usage list, one without any, and one more
+# with usage, 1500 ns per request served plus 7 in all, so a run records
+# 1500 ns for each request sent between its two readings and no other figure.
+# Clients of two other processes, one whose pid begins with the server's, are
+# listed in every mode.
 STUB_IOREG = r'''
 import os, sys
 
@@ -185,9 +222,7 @@ mode = read("mode", "ok")
 if mode == "fails":
     sys.stderr.write("ioreg: stub failure\n")
     sys.exit(1)
-calls = int(read("calls", "0")) + 1
-with open(os.path.join(here, "calls"), "w") as fh:
-    fh.write(str(calls))
+served = int(read("served", "0"))
 pid = int(read("server.pid", "0"))
 
 
@@ -211,14 +246,16 @@ def client(number, owner_pid, name, usage):
 clients = [client(1, 1, "launchd", [10**12]), client(2, pid * 10 + 1, "other", [10**9])]
 if mode == "ok":
     clients += [
-        client(3, pid, "mlxcel-server", [1000 * calls, 7]),
+        client(3, pid, "mlxcel-server", [1000 * served, 7]),
         client(4, pid, "mlxcel-server", []),
         client(5, pid, "mlxcel-server", None),
-        client(6, pid, "mlxcel-server", [500 * calls]),
+        client(6, pid, "mlxcel-server", [500 * served]),
     ]
 print("\n".join(clients))
 '''
-STUB_GPU_TIME_NS = 1500
+STUB_GPU_TIME_NS_PER_REQUEST = 1500
+# Footprints the fake reading of footprint_seen_while_busy returns.
+FOOTPRINT_IDLE, FOOTPRINT_BUSY = 100 * 1024**2, 900 * 1024**2
 # How the stub `ioreg` is broken, and the `gpu_time_source` a run then records.
 GPU_TIME_FAILURES = {
     "missing": "unavailable: ioreg not found",
@@ -311,6 +348,23 @@ class ToolTestCase(unittest.TestCase):
         finally:
             mode.unlink()
 
+    def footprint_seen_while_busy(self):
+        """Fakes the footprint reading for the stub server's "busy-footprint"
+        mode: FOOTPRINT_BUSY while the stub holds a request, which it does
+        until a reading has seen it, and FOOTPRINT_IDLE at any other time. A
+        footprint window therefore peaks at FOOTPRINT_BUSY only when it is
+        open while the request is in flight."""
+
+        def read_footprint(pid):
+            try:
+                nth = (self.ioreg_state / "busy").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return FOOTPRINT_IDLE
+            (self.ioreg_state / "seen").write_text(nth, encoding="utf-8")
+            return FOOTPRINT_BUSY
+
+        return mock.patch.object(brr, "read_footprint", side_effect=read_footprint)
+
     def run_tool(
         self, mode, stub_mode="ok", extra=(), out=None, binary=sys.executable, port=None
     ):
@@ -383,6 +437,16 @@ class ReplayTest(ToolTestCase):
             run["footprint_source"], "proc_pid_rusage" if ON_MACOS else "unavailable"
         )
         self.assert_footprint(run["footprint_lifetime_max_bytes"])
+
+    def test_footprint_peak_is_sampled_while_the_request_is_in_flight(self):
+        with self.footprint_seen_while_busy():
+            code, _, _, result = self.run_tool("replay", stub_mode="busy-footprint")
+        self.assertEqual(code, 0)
+        for row in result["requests"]:
+            self.assertEqual(
+                (row["footprint_peak_bytes"], row["footprint_retained_bytes"]),
+                (FOOTPRINT_BUSY, FOOTPRINT_IDLE),
+            )
 
     def test_environment_reaches_the_server_and_only_safe_values_are_recorded(self):
         code, stdout, stderr, result = self.run_tool(
@@ -1736,15 +1800,19 @@ class GpuTimeTest(ToolTestCase):
         self.assertIsNone(brr.gpu_time_in("", 4242))
 
     def test_runs_record_the_server_gpu_time(self):
-        for mode, extra in (
-            ("replay", []),
-            ("concurrent", ["--in-flight", "2"]),
-            ("abandon", ["--abandon-after", "30", "--min-documents", "3"]),
+        # `abandon` sends four requests per large request: the probe alone,
+        # the large request, the probe behind it and one more probe.
+        for mode, extra, sent in (
+            ("replay", [], 4),
+            ("concurrent", ["--in-flight", "2"], 4),
+            ("abandon", ["--abandon-after", "30", "--min-documents", "3"], 8),
         ):
             with self.subTest(mode=mode):
                 code, _, _, result = self.run_tool(mode, extra=extra)
                 self.assertEqual(code, 0)
-                self.assertEqual(result["run"]["gpu_time_ns"], STUB_GPU_TIME_NS)
+                self.assertEqual(
+                    result["run"]["gpu_time_ns"], sent * STUB_GPU_TIME_NS_PER_REQUEST
+                )
                 self.assertEqual(result["run"]["gpu_time_source"], "ioreg")
 
     def test_unreadable_gpu_time_is_null_with_the_reason_and_the_run_completes(self):
