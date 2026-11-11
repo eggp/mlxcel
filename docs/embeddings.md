@@ -511,6 +511,8 @@ Default `instruction`: `Given a web search query, retrieve relevant passages tha
 
 Rows are **left**-padded with the checkpoint's pad token, which is what puts every row's last real token at column `L - 1`, and the mask is `create_causal_padding_mask`, so the pad prefix is blocked as a key everywhere. Absolute positions still run `0..L` over the padded row, exactly as the reference `Qwen3ForCausalLM.forward(input_ids, attention_mask)` does when it derives `position_ids` from the cache position. One consequence worth knowing: a document's score depends slightly on the batch it was scored in, because a left-padded row's real tokens sit at shifted positions. That is a property of the reference recipe, not of this port.
 
+A request's rows are sorted by token length, longest first and equal lengths in arrival order, cut into micro-batches of `--rerank-batch-size`, and the scores are written back in request order. Which rows share a micro-batch therefore depends on the lengths of the request's documents, not on the order they were sent in.
+
 ### Qwen3-VL generative scoring
 
 The prompt comes from the checkpoint's own `additional_chat_templates/reranker.jinja`, rendered with `add_generation_prompt: true`. That template reads `role: query` and `role: document` messages (not `user`), supplies its own default instruction (`Given a search query, retrieve relevant candidates that answer the query.`) when no `system` message is present, and renders each image content item as `<|vision_start|><|image_pad|><|vision_end|>`. Rendering is delegated to it verbatim, so a re-exported checkpoint with a different prompt stays correct. The two answer token ids come from `1_LogitScore/config.json` (`true_token_id` 9693, `false_token_id` 2152).

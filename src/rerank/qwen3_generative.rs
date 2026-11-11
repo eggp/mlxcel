@@ -269,6 +269,18 @@ impl Qwen3Reranker {
     }
 }
 
+/// Row indices in the order the micro-batches take them: longest row first,
+/// rows of equal length in arrival order.
+///
+/// A micro-batch is padded to its longest row, so cutting this order into
+/// batches keeps rows of similar length together. The sort is stable, which
+/// makes the batches a function of the row lengths alone.
+fn batching_order(lengths: &[usize]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..lengths.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(lengths[index]));
+    order
+}
+
 /// `max_length` for a generative reranker: the shared 8192 ceiling, lowered by
 /// the checkpoint's declared limits and by `--rerank-max-length`.
 ///
@@ -306,15 +318,22 @@ impl Reranker for Qwen3Reranker {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let mut scores = Vec::with_capacity(rows.len());
+        let lengths: Vec<usize> = rows.iter().map(|row| row.ids.len()).collect();
+        let mut scores = vec![0.0f32; rows.len()];
         let mut prompt_tokens = 0usize;
-        for chunk in rows.chunks(self.batch_size) {
+        for chunk in batching_order(&lengths).chunks(self.batch_size) {
             if is_abandoned() {
                 bail!(super::RerankAbandoned);
             }
-            let (chunk_scores, tokens) = self.score_rows(chunk)?;
+            let chunk_rows: Vec<EncodedRow> =
+                chunk.iter().map(|&index| rows[index].clone()).collect();
+            // `score_rows` returns exactly one score per row, so every index
+            // of the chunk is written.
+            let (chunk_scores, tokens) = self.score_rows(&chunk_rows)?;
             prompt_tokens += tokens;
-            scores.extend(chunk_scores);
+            for (&index, score) in chunk.iter().zip(chunk_scores) {
+                scores[index] = score;
+            }
         }
         Ok(RerankScores {
             scores,
