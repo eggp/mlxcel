@@ -161,7 +161,7 @@ The tool exists because six published figures from the 2026-09 campaign were wro
 
 ## Replaying recorded rerank requests
 
-`scripts/bench_embeddings.py` times `/v1/rerank` on a few fixed synthetic workloads. `scripts/bench_rerank_replay.py` answers a different question: how one server binary and configuration behaves on several hundred requests a deployment really served, and how that differs from another binary or configuration on the same requests. It starts the server itself, sends every request of a local file to `POST /v1/rerank`, records time, memory and scores per request, stops the server, and compares two such runs. It uses the Python standard library only.
+`scripts/bench_embeddings.py` times `/v1/rerank` on a few fixed synthetic workloads. `scripts/bench_rerank_replay.py` answers a different question: how one server binary and configuration behaves on several hundred requests a deployment really served, and how that differs from another binary or configuration on the same requests. It starts the server itself, sends every request of a local file to `POST /v1/rerank`, records time, memory and scores per request and the server's GPU time for the whole run, stops the server, and compares two such runs. It uses the Python standard library only.
 
 ### The request file is private
 
@@ -229,7 +229,7 @@ scripts/bench_rerank_replay.py abandon --abandon-after 1.0 --min-documents 50 \
 
 A request file with a single request, with no request of at least `--min-documents` documents, or with no request of fewer (the probe would then be a large request itself), is refused before anything is executed. When the server answers a large request before `--abandon-after` has passed, that request was not abandoned: the tool reads and drops the response, records the request as not abandoned and still runs steps 3 and 4. Raise `--min-documents` or lower `--abandon-after` if that happens often. A large request that cannot be sent at all stops the run with exit status 2.
 
-`abandon` measures the wall time the next caller sees, from the client. It does not measure GPU time, and it cannot tell whether the server stopped scoring the abandoned request or finished it quickly: it shows only how long the next request waited.
+`abandon` measures the wall time the next caller sees, from the client. Its GPU time covers the whole run, every probe included, not one request, and it cannot tell whether the server stopped scoring the abandoned request or finished it quickly: it shows only how long the next request waited.
 
 `compare` reads two result files written by `replay` or `concurrent`, or two written by `abandon`, and starts nothing. It refuses a `startup` file, and a pair in which only one file is an `abandon` result:
 
@@ -256,6 +256,8 @@ A result file is one JSON object. `run` is recorded once:
 | `large_requests` | the number of requests with at least `min_documents` documents (`abandon`) |
 | `footprint_source` | `proc_pid_rusage`, or `unavailable` |
 | `footprint_lifetime_max_bytes` | the largest footprint the server process ever had, read once before it is stopped |
+| `gpu_time_ns` | the GPU time the server process used during the run, in nanoseconds (`replay`, `concurrent`, `abandon`); `null` when it could not be read |
+| `gpu_time_source` | `ioreg`, or `unavailable: ` followed by the reason: `ioreg not found`, `ioreg failed`, or `no GPU client of the server process` |
 
 `requests` (`replay`, `concurrent`) has one entry per request, in file order:
 
@@ -285,6 +287,8 @@ A result file is one JSON object. `run` is recorded once:
 
 Memory is the physical footprint, `ri_phys_footprint` from `proc_pid_rusage`, sampled about ten times a second and once more at each end of every request (`abandon` reads it once per large request and records no peak). RSS is not used because it does not include the Metal GPU buffers. `proc_pid_rusage` exists on macOS only: on any other platform every footprint field is `null` and `footprint_source` is `unavailable`, and the tool does not substitute another figure. Under `concurrent` the footprint belongs to the whole server process, so the peak of one request includes whatever the other requests in flight held at the time.
 
+GPU time is measured directly, not inferred from shorter request times. macOS keeps a cumulative GPU time counter per Metal client, readable without root: `ioreg -r -w 0 -c AGXDeviceUserClient` lists every client with `"IOUserClientCreator" = "pid <pid>, <name>"` and, once the client has used the GPU, an `"AppUsage"` list whose entries carry `"accumulatedGPUTime"` in nanoseconds. A process can own several clients, and a client can have an empty `AppUsage` list or none at all. The tool sums `accumulatedGPUTime` over every client of the server process once the server answers and again after the last request, and records the second sum minus the first, so model loading is not in it. The figure belongs to the whole process for the whole run: under `concurrent` it cannot be split between requests, and a client the server closes during the run takes its time with it. When `ioreg` is not on `PATH` (any platform other than macOS), exits with an error, or lists no client of the server process, `gpu_time_ns` is `null`, `gpu_time_source` names the reason, and the run completes as usual.
+
 A `200` response counts as scored only when it gives every document exactly one finite number: a missing or repeated index, a boolean, `NaN` or an infinity makes the request a `bad_response` failure. `startup` judges both of its requests by the same rule, so a start whose response is such a `200` is a failed start. The result file is strict JSON.
 
 The exit status is 0 when every request was scored (under `abandon`: every probe), 1 when at least one failed (the result file is still written, with the failures in it), and 2 when the run could not be carried out: a bad request file, a `--port` outside 1 to 65535 or already in use, an empty `--out`, an output directory that is missing or an output file that cannot be written, a binary that does not run, a server that exits early or never becomes ready, a server that exits during the run. To see why a server did not start, run the same binary with the same arguments by hand, since the tool discards its output.
@@ -295,15 +299,15 @@ When the server exits during the run, the run stops there. The tool checks its s
 
 ### Reading a comparison
 
-`compare` pairs requests by `id` and prints, as after minus before, the minimum, 5th percentile, median, 95th percentile and maximum of the wall time difference, the peak footprint difference and the retained footprint difference. It then prints the largest absolute score difference over every document of every compared request, and the share of compared requests whose top 5 set and whose top 10 set of documents differ. A request with fewer documents than the cut-off compares all of its documents, so its set cannot differ.
+`compare` pairs requests by `id` and prints, as after minus before, the minimum, 5th percentile, median, 95th percentile and maximum of the wall time difference, the peak footprint difference and the retained footprint difference. It then prints the server GPU time of each run in milliseconds with its `gpu_time_source`, and the difference, after minus before; `n/a` where a file has no value, and `not recorded` as the source of a file written before the tool recorded GPU time. It then prints the largest absolute score difference over every document of every compared request, and the share of compared requests whose top 5 set and whose top 10 set of documents differ. A request with fewer documents than the cut-off compares all of its documents, so its set cannot differ.
 
 Scores are reproducible for a fixed request, yet they depend on which documents share a micro-batch. A change that reorders documents therefore moves scores slightly without being wrong, and the score difference alone cannot tell that apart from a change that alters results. The top 5 and top 10 shares are what say whether the ranking a caller sees moved.
 
 Nothing is dropped silently. The report counts the requests present in only one file, those that failed in at least one file, and those whose document count differs under the same id, and none of them enter the distributions.
 
-`compare` refuses, with exit status 2, a file it cannot pair reliably. Each entry of `requests` must have every field of the table above, a missing one is not read as `null`, with a string or integer `id`, an integer `documents`, `scores` that is `null` or a non-empty array of finite numbers as long as `documents` says, and `wall_ms` and the two footprint fields `null` or finite numbers. An id may appear once per file. The message names the file and the position of the first unfit entry, or the number of ids that appear more than once, never an id or any other content.
+`compare` refuses, with exit status 2, a file it cannot pair reliably. Each entry of `requests` must have every field of the table above, a missing one is not read as `null`, with a string or integer `id`, an integer `documents`, `scores` that is `null` or a non-empty array of finite numbers as long as `documents` says, and `wall_ms` and the two footprint fields `null` or finite numbers. An id may appear once per file. In `run`, `gpu_time_ns` may be missing (a file written before GPU time was recorded) and is otherwise `null` or an integer, and `gpu_time_source`, where present, is a string. The message names the file and the position of the first unfit entry, or the number of ids that appear more than once, never an id or any other content.
 
-For two `abandon` files `compare` pairs the large requests by `id` and compares those that were abandoned in both files with every probe answered. It prints the minimum, 5th percentile, median, 95th percentile and maximum of the probe's wall time behind the abandoned request in the before file, in the after file, and of the per-request difference, after minus before. It prints the same three lines for the probe alone. Read the pair like this: the probe alone is what the probe costs on an idle server, and its difference between the two files is the noise of the method. The probe behind an abandoned request is that cost plus whatever the server still spent on a request nobody was waiting for. The gap between the two figures in one file is therefore the wait the abandoned request caused in that run, and the "after minus before" line of the second figure is how much that wait changed between the files; a difference no larger than the one between the two "alone" lines is unresolved.
+For two `abandon` files `compare` pairs the large requests by `id` and compares those that were abandoned in both files with every probe answered. It prints the minimum, 5th percentile, median, 95th percentile and maximum of the probe's wall time behind the abandoned request in the before file, in the after file, and of the per-request difference, after minus before. It prints the same three lines for the probe alone, then the server GPU time of each run and the difference, as for `replay` files. Read the pair like this: the probe alone is what the probe costs on an idle server, and its difference between the two files is the noise of the method. The probe behind an abandoned request is that cost plus whatever the server still spent on a request nobody was waiting for. The gap between the two figures in one file is therefore the wait the abandoned request caused in that run, and the "after minus before" line of the second figure is how much that wait changed between the files; a difference no larger than the one between the two "alone" lines is unresolved.
 
 The counts come first here too: the large requests present in only one file, those not abandoned in at least one file, and those with a failed probe in at least one file (a request that is both is counted as a failed probe). None of them enter the distributions. Each entry of an `abandon` file must have every field of its table, with `abandoned_after_ms`, the two wall times and the footprint `null` or finite numbers and each error field `null` or a string. A wall time may be `null` only for a failed probe: one whose status is not 200 and whose error field names the category.
 
@@ -332,7 +336,116 @@ Use this when a change is meant to stop the server working on a request whose ca
 5. Read the two numbers. "Probe wall time alone" is the cost of the small request on an idle server. "Probe wall time behind an abandoned request" is what the next caller waited. The second minus the first, within one file, is the wait the abandoned request added in that run: the larger it is, the longer the server stayed busy after the caller hung up. Whether a binary shows a large or a small gap is what the run measures.
 6. Compare the two base runs with each other as well. Their differences are the noise of the method, and a base to candidate difference inside them is unresolved.
 
-These are wall times seen by the client. They say how long the next request waited, not how much GPU time the server spent, and not why it waited.
+These are wall times seen by the client. They say how long the next request waited, not why it waited. The GPU time line of `compare` is the server's GPU time over the whole run, probes included: a candidate that stops work on abandoned requests should show less of it, but the line cannot say which request the difference came from.
+
+## Replaying recorded embedding requests
+
+`scripts/bench_embeddings.py` times `/v1/embeddings` on fixed synthetic sentences. `scripts/bench_embed_replay.py` is the embedding counterpart of `scripts/bench_rerank_replay.py`: it starts the server, sends every request of a local file to `POST /v1/embeddings`, records time, memory, the token count and the vectors per request and the server's GPU time for the whole run, stops the server, and compares two such runs. It takes the server process, the port and output checks, the footprint and GPU time readings and the result file handling from the rerank tool, so everything the rerank section above says about them holds here unchanged: the private request file, the free port and its documented limit, `--out`, the exit status, Ctrl-C, a server that exits during the run, memory, GPU time, and the two rules for a valid comparison. This section describes only what differs. It uses the Python standard library only.
+
+### The request file
+
+The file holds real texts: keep it outside the repository, as for the rerank tool. One JSON object per line:
+
+```json
+{"id": "optional-string", "texts": ["...", "..."]}
+```
+
+`texts` is a non-empty array of strings, `id` an optional string that must be unique in the file. A request without `id` is identified by its 1-based line number. Each line becomes one `POST /v1/embeddings` call with `"input"` set to the texts and `"encoding_format": "base64"`, as the client the tool replays sends it: the server then returns each vector as base64 of little-endian `f32` values, about 5.5 KB for a 1024-dimension vector, where a JSON float array would be far larger.
+
+### Modes
+
+The modes and the server options are those of the rerank tool. `--server-args` names the embedding checkpoint, `-m <embedding dir>`; `abandon` takes `--min-texts` in place of `--min-documents`.
+
+`replay` sends the requests one at a time:
+
+```bash
+scripts/bench_embed_replay.py replay --bin target/release/mlxcel-server \
+    --server-args="-m <embedding dir>" \
+    --requests ~/private/embed-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/embed-replay-base.json
+```
+
+`concurrent` keeps N requests in flight; the documented uses are 2 and 3:
+
+```bash
+scripts/bench_embed_replay.py concurrent --in-flight 2 --bin target/release/mlxcel-server \
+    --server-args="-m <embedding dir>" \
+    --requests ~/private/embed-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/embed-concurrent2-base.json
+```
+
+`startup` starts the server K times and sends the first request of the file twice per start:
+
+```bash
+scripts/bench_embed_replay.py startup --starts 5 --page-cache warm --bin target/release/mlxcel-server \
+    --server-args="-m <embedding dir>" \
+    --requests ~/private/embed-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/embed-startup-base.json
+```
+
+`abandon` runs the four steps of the rerank tool's `abandon`. The probe is the request with the fewest texts, the first such one in file order, and every request with at least `--min-texts` texts is a large request. A file with a single request, with no request of at least `--min-texts` texts, or with no request of fewer, is refused before anything is executed:
+
+```bash
+scripts/bench_embed_replay.py abandon --abandon-after 1.0 --min-texts 50 \
+    --bin target/release/mlxcel-server \
+    --server-args="-m <embedding dir>" \
+    --requests ~/private/embed-requests.jsonl --commit <revision> \
+    --live-traffic no --out ~/private/embed-abandon-base.json
+```
+
+`compare` reads two `replay` or `concurrent` result files, or two `abandon` ones, of this tool:
+
+```bash
+scripts/bench_embed_replay.py compare --before ~/private/embed-replay-base.json \
+    --after ~/private/embed-replay-fix.json
+```
+
+Every measuring run prints one line per request, `id=<id> texts=<n> status=<status> wall_ms=...` (under `abandon`, one line per large request), and ends with `N of M requests embedded, F failed` (under `abandon`, `N large requests: A abandoned, B not abandoned, F with a failed probe`) and the path it wrote.
+
+### Reading a result file
+
+`run` holds the fields of the rerank tool's `run`, `gpu_time_ns` and `gpu_time_source` included, with `min_texts` and `probe_texts` in place of `min_documents` and `probe_documents` under `abandon`.
+
+`requests` (`replay`, `concurrent`) has one entry per request, in file order:
+
+| Field | Holds |
+|-------|-------|
+| `id` | the supplied id, or the line number |
+| `texts` | the number of texts |
+| `in_flight` | the `--in-flight` value, 1 for `replay` |
+| `wall_ms` | client-side wall time, request sent to response read |
+| `footprint_peak_bytes` | the largest footprint sampled while the request was open |
+| `footprint_retained_bytes` | the footprint read right after the response |
+| `status`, `error` | the HTTP status, and `null` or one of `http_status`, `bad_response`, `transport:<exception>`; the response body is never recorded |
+| `prompt_tokens` | `usage.prompt_tokens` of the response, `null` when the request failed |
+| `vectors` | one vector per text, in the request's text order, each the base64 string the server returned (little-endian `f32`); `null` when the request failed |
+
+`starts` (`startup`) and `requests` (`abandon`) have the fields of the rerank tool's, with `texts` in place of `documents`.
+
+A `200` response counts as embedded only when it gives every text exactly one vector that is strict base64 of a whole, non-zero number of finite `f32` values, and a non-negative integer `usage.prompt_tokens`. Anything else is a `bad_response` failure.
+
+### Reading a comparison
+
+For two `replay` or `concurrent` files `compare` pairs requests by `id` and prints the counts (requests in one file only, failed in at least one file, a different text count under one id), the wall time and footprint spreads and the server GPU time lines of the rerank tool, and then, text by text over the compared requests:
+
+- `texts compared`: the texts whose two vectors have the same dimension; `different dimension` counts the others, which enter nothing below;
+- `bit-identical`: the texts whose two vectors have the same bytes;
+- `all-zero vector on a side`: the texts without a cosine similarity, because one of their vectors is all zeros;
+- `max absolute component difference`: the largest absolute difference between two components at the same position;
+- `lowest cosine similarity`: the smallest cosine similarity of a text's two vectors.
+
+Bit-identical vectors show that a change left the numerics alone. A change that reorders work, such as a different batch composition, can move the last bits of a vector without being wrong; the lowest cosine similarity is what says whether any text's vector moved in a way that matters to a caller.
+
+For two `abandon` files `compare` prints what the rerank tool prints for them, GPU time included, with `min_texts` and `probe_texts` in the two header lines.
+
+`compare` refuses, with exit status 2, a file whose `requests` entry lacks a field of the table above, has a `vectors` entry that is not `null` or a non-empty array of such vectors as long as `texts` says, or a `prompt_tokens` that is not `null` or a non-negative integer, and refuses a rerank result file, as the rerank tool refuses its unfit files.
+
+### Step by step
+
+1. Export the recorded embedding requests into a JSON Lines file outside the repository, in the format above.
+2. Build the old and the new binary, note each revision for `--commit`, and decide the `--live-traffic` value.
+3. Run `replay` against the old binary, then the new one, then the old, then the new, each run with its own `--out` file; then the same with `concurrent --in-flight 2` and `--in-flight 3`. A run that ends with `error:` and exit status 2 wrote nothing: repeat it, and keep the alternating order.
+4. Run `compare` for each old and new pair, and for the two runs of the same binary. Read the counts first, then the wall time, footprint and GPU time lines: the differences between two runs of the same binary are the spread of the method, and a gain is resolved only when it is larger than that spread. Then read the vector lines: a candidate meant to leave the numerics alone shows every text bit-identical.
 
 ## Suggested benchmark commands
 

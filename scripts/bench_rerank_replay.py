@@ -17,9 +17,10 @@
 Starts the given mlxcel-server binary, sends every request of a local JSON
 Lines file to POST /v1/rerank, and writes one JSON result file with, per
 request, the client wall time, the peak and the retained physical footprint of
-the server process, the HTTP status and the scores in document order. A second
-run against another binary or configuration gives a second file, and `compare`
-reports how the two differ, ranking changes included.
+the server process, the HTTP status and the scores in document order, and for
+the whole run the GPU time of the server process. A second run against another
+binary or configuration gives a second file, and `compare` reports how the two
+differ, ranking changes included.
 
 The request file is private. Its text is sent to the local server and nowhere
 else: result files and console output carry ids, counts, timings, memory
@@ -36,6 +37,12 @@ Memory is the physical footprint (`ri_phys_footprint` from `proc_pid_rusage`),
 read through ctypes several times per second. RSS is not used: it does not
 include the Metal GPU buffers. Off macOS the footprint fields are null and the
 run records `"footprint_source": "unavailable"`.
+
+GPU time is the sum of `accumulatedGPUTime` (ns) over the server process's
+Metal clients in `ioreg -r -w 0 -c AGXDeviceUserClient`, read once the server
+is ready and again after the last request; the run records the difference.
+When `ioreg` is missing, fails, or lists no client of the server process, the
+value is null and `gpu_time_source` says why.
 
 Modes:
   replay      one request at a time
@@ -67,6 +74,7 @@ import http.client
 import json
 import math
 import os
+import re
 import select
 import shlex
 import socket
@@ -241,6 +249,62 @@ class FootprintSampler:
                 self._open.remove(window)
 
 
+# --- GPU time ----------------------------------------------------------------
+
+# Every Metal client of a process is one AGXDeviceUserClient entry; its
+# `AppUsage` list, which can be empty or absent, holds the GPU time it used.
+IOREG_COMMAND = ("ioreg", "-r", "-w", "0", "-c", "AGXDeviceUserClient")
+IOREG_TIMEOUT_S = 60.0
+GPU_TIME_SOURCE = "ioreg"
+_CLIENT_CREATOR = re.compile(r'"IOUserClientCreator" = "pid (\d+),')
+_ACCUMULATED_GPU_TIME = re.compile(r'"accumulatedGPUTime"=(\d+)')
+
+
+def gpu_time_in(listing: str, pid: int) -> int | None:
+    """Sum of `accumulatedGPUTime` over the clients of `pid` in an ioreg
+    listing, in ns; None when the listing has no client of `pid`."""
+    total = None
+    for client in listing.split("+-o ")[1:]:
+        creator = _CLIENT_CREATOR.search(client)
+        if creator is None or int(creator.group(1)) != pid:
+            continue
+        used = sum(int(ns) for ns in _ACCUMULATED_GPU_TIME.findall(client))
+        total = used if total is None else total + used
+    return total
+
+
+def read_gpu_time(pid: int) -> tuple[int | None, str]:
+    """GPU time `pid` has used so far, in ns, and its source; the value is
+    None and the source says why when it cannot be read."""
+    try:
+        done = subprocess.run(
+            list(IOREG_COMMAND),
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=IOREG_TIMEOUT_S,
+        )
+    except FileNotFoundError:
+        return None, "unavailable: ioreg not found"
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unavailable: ioreg failed"
+    if done.returncode != 0:
+        return None, "unavailable: ioreg failed"
+    total = gpu_time_in(done.stdout, pid)
+    if total is None:
+        return None, "unavailable: no GPU client of the server process"
+    return total, GPU_TIME_SOURCE
+
+
+def gpu_time_fields(start: tuple, end: tuple) -> dict:
+    """The run's `gpu_time_ns`, `end` minus `start` (two `read_gpu_time`
+    results), and `gpu_time_source`, the reason of the first failed read."""
+    for value, source in (start, end):
+        if value is None:
+            return {"gpu_time_ns": None, "gpu_time_source": source}
+    return {"gpu_time_ns": end[0] - start[0], "gpu_time_source": GPU_TIME_SOURCE}
+
+
 # --- request file ------------------------------------------------------------
 
 
@@ -251,12 +315,27 @@ class RerankRequest:
     documents: list[str]
 
 
-def load_requests(path: str) -> list[RerankRequest]:
-    """Read and validate the request file.
+def is_string_list(value) -> bool:
+    """True for a non-empty list of strings."""
+    return isinstance(value, list) and bool(value) and all(isinstance(v, str) for v in value)
 
-    Error messages name the file and the line, never the line's content.
+
+def rerank_request(item: dict, request_id: str | int, where: str) -> RerankRequest:
+    if not isinstance(item.get("query"), str):
+        raise InputError(f"{where}: `query` must be a string")
+    if not is_string_list(item.get("documents")):
+        raise InputError(f"{where}: `documents` must be a non-empty array of strings")
+    return RerankRequest(request_id, item["query"], item["documents"])
+
+
+def read_request_file(path: str, make) -> list:
+    """Read and validate a request file, one JSON object per line.
+
+    `make(item, request_id, where)` builds the request from one object or
+    raises InputError. Error messages name the file and the line, never the
+    line's content.
     """
-    requests: list[RerankRequest] = []
+    requests = []
     seen: set = set()
     try:
         with open(path, encoding="utf-8") as fh:
@@ -270,30 +349,23 @@ def load_requests(path: str) -> list[RerankRequest]:
                     raise InputError(f"{where}: not valid JSON") from None
                 if not isinstance(item, dict):
                     raise InputError(f"{where}: not a JSON object")
-                query = item.get("query")
-                documents = item.get("documents")
                 request_id = item.get("id", line_no)
-                if not isinstance(query, str):
-                    raise InputError(f"{where}: `query` must be a string")
-                if (
-                    not isinstance(documents, list)
-                    or not documents
-                    or not all(isinstance(d, str) for d in documents)
-                ):
-                    raise InputError(
-                        f"{where}: `documents` must be a non-empty array of strings"
-                    )
+                request = make(item, request_id, where)
                 if "id" in item and not isinstance(request_id, str):
                     raise InputError(f"{where}: `id` must be a string")
                 if request_id in seen:
                     raise InputError(f"{where}: duplicate request id")
                 seen.add(request_id)
-                requests.append(RerankRequest(request_id, query, documents))
+                requests.append(request)
     except (OSError, UnicodeDecodeError) as exc:
         raise InputError(f"{path}: cannot read: {type(exc).__name__}") from None
     if not requests:
         raise InputError(f"{path}: no requests")
     return requests
+
+
+def load_requests(path: str) -> list[RerankRequest]:
+    return read_request_file(path, rerank_request)
 
 
 # --- server process ----------------------------------------------------------
@@ -366,39 +438,44 @@ def require_running(proc: subprocess.Popen, settle: bool = False) -> None:
 SEND_LOCK = threading.Lock()
 
 
-def post_to_running(proc: subprocess.Popen, port: int, request: RerankRequest):
+def post_to_running(proc: subprocess.Popen, port: int, request, send=None, read=None):
     """Send one request to the started server, refused when it is gone.
 
-    Returns (wall_ms, status, scores, error) and raises ServerError when the
-    server is found dead before the send or after the response. The wall time
-    starts once the lock is held, so waiting for another worker is not in it.
+    `send(port, request)` and `read(conn, request)` speak the endpoint; they
+    default to `send_rerank` and `read_rerank`. Returns (wall_ms, status,
+    result, error) and raises ServerError when the server is found dead
+    before the send or after the response. The wall time starts once the
+    lock is held, so waiting for another worker is not in it.
     """
+    send, read = send or send_rerank, read or read_rerank
     with SEND_LOCK:
         require_running(proc)
         start = time.perf_counter()
-        conn, error = send_rerank(port, request)
-    status = scores = None
+        conn, error = send(port, request)
+    status = result = None
     if conn is not None:
-        status, scores, error = read_rerank(conn, len(request.documents))
+        status, result, error = read(conn, request)
     wall_ms = round((time.perf_counter() - start) * 1000.0, 3)
     with SEND_LOCK:
         require_running(proc, settle=status is None)
-    return wall_ms, status, scores, error
+    return wall_ms, status, result, error
 
 
 def abandon_request(
-    proc: subprocess.Popen, port: int, request: RerankRequest, delay_s: float
+    proc: subprocess.Popen, port: int, request, delay_s: float, send=None, read=None
 ) -> float | None:
     """Send one request and hang up `delay_s` seconds later, reading nothing.
 
-    Returns the delay applied, in ms from the request sent to the connection
-    closed. Returns None when the server answered within the delay: that
-    response is read and dropped, and the request was not abandoned. Raises
-    ServerError when the server is found dead, or the request cannot be sent.
+    `send` and `read` are those of `post_to_running`. Returns the delay
+    applied, in ms from the request sent to the connection closed. Returns
+    None when the server answered within the delay: that response is read
+    and dropped, and the request was not abandoned. Raises ServerError when
+    the server is found dead, or the request cannot be sent.
     """
+    send, read = send or send_rerank, read or read_rerank
     with SEND_LOCK:
         require_running(proc)
-        conn, error = send_rerank(port, request)
+        conn, error = send(port, request)
         sent = time.perf_counter()
     if conn is None:
         with SEND_LOCK:
@@ -410,7 +487,7 @@ def abandon_request(
     remaining = delay_s
     while remaining > 0:
         if select.select([conn.sock], [], [], remaining)[0]:
-            status, _, _ = read_rerank(conn, len(request.documents))
+            status, _, _ = read(conn, request)
             with SEND_LOCK:
                 require_running(proc, settle=status is None)
             return None
@@ -502,20 +579,20 @@ def scores_in_document_order(payload, document_count: int) -> list[float]:
     return scores
 
 
-def send_rerank(port: int, request: RerankRequest):
-    """Connect and send one request. Returns (connection, error).
+def send_json(port: int, path: str, payload: dict):
+    """Connect and POST `payload` to `path`. Returns (connection, error).
 
     The connection is None when the request could not be sent. `error` is a
-    short category, here and in `read_rerank`, and never response text, which
+    short category, here and in `read_json`, and never response text, which
     may echo the request.
     """
-    body = json.dumps({"query": request.query, "documents": request.documents})
+    body = json.dumps(payload)
     conn = None
     try:
         conn = http.client.HTTPConnection(HOST, port, timeout=REQUEST_TIMEOUT_S)
         conn.request(
             "POST",
-            "/v1/rerank",
+            path,
             body=body.encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -526,10 +603,11 @@ def send_rerank(port: int, request: RerankRequest):
     return conn, None
 
 
-def read_rerank(conn: http.client.HTTPConnection, document_count: int):
+def read_json(conn: http.client.HTTPConnection, parse):
     """Read the response to a sent request and close the connection.
 
-    Returns (status, scores, error).
+    A 200 body is decoded and handed to `parse`, which raises ValueError for
+    an unusable one. Returns (status, parsed, error).
     """
     try:
         try:
@@ -542,9 +620,22 @@ def read_rerank(conn: http.client.HTTPConnection, document_count: int):
     if response.status != 200:
         return response.status, None, "http_status"
     try:
-        return 200, scores_in_document_order(json.loads(raw), document_count), None
+        return 200, parse(json.loads(raw)), None
     except ValueError:
         return 200, None, "bad_response"
+
+
+def send_rerank(port: int, request: RerankRequest):
+    return send_json(
+        port, "/v1/rerank", {"query": request.query, "documents": request.documents}
+    )
+
+
+def read_rerank(conn: http.client.HTTPConnection, request: RerankRequest):
+    """Returns (status, scores, error)."""
+    return read_json(
+        conn, lambda payload: scores_in_document_order(payload, len(request.documents))
+    )
 
 
 def measure_request(
@@ -642,6 +733,7 @@ def run_replay(args: argparse.Namespace) -> int:
     run = run_record(args)
     run["in_flight"] = in_flight
     with running_server(args, answers_http) as proc:
+        gpu_start = read_gpu_time(proc.pid)
         with FootprintSampler(proc.pid) as sampler:
 
             def one(request: RerankRequest) -> dict:
@@ -657,6 +749,7 @@ def run_replay(args: argparse.Namespace) -> int:
 
             with ThreadPoolExecutor(max_workers=in_flight) as pool:
                 rows = list(pool.map(one, requests))
+        run.update(gpu_time_fields(gpu_start, read_gpu_time(proc.pid)))
         run["footprint_lifetime_max_bytes"] = read_lifetime_max_footprint(proc.pid)
     failed = sum(1 for row in rows if row["scores"] is None)
     print(f"{len(rows) - failed} of {len(rows)} requests scored, {failed} failed")
@@ -706,10 +799,9 @@ def run_startup(args: argparse.Namespace) -> int:
     return 1 if failed else 0
 
 
-# The keys of a row `run_abandon` writes.
-ABANDON_ROW_KEYS = (
-    "id",
-    "documents",
+# The keys of a row `run_abandon` writes, after `id` and the count of what the
+# request holds.
+ABANDON_MEASURE_KEYS = (
     "abandoned_after_ms",
     "alone_wall_ms",
     "alone_status",
@@ -721,6 +813,7 @@ ABANDON_ROW_KEYS = (
     "idle_error",
     "footprint_retained_bytes",
 )
+ABANDON_ROW_KEYS = ("id", "documents", *ABANDON_MEASURE_KEYS)
 ABANDON_PROBES = ("alone", "behind", "idle")
 
 
@@ -757,6 +850,7 @@ def run_abandon(args: argparse.Namespace) -> int:
     run["large_requests"] = len(large)
     rows = []
     with running_server(args, answers_http) as proc:
+        gpu_start = read_gpu_time(proc.pid)
         for request in large:
             alone_ms, alone_status, _, alone_error = post_to_running(proc, args.port, probe)
             abandoned_after_ms = abandon_request(proc, args.port, request, args.abandon_after)
@@ -794,6 +888,7 @@ def run_abandon(args: argparse.Namespace) -> int:
                 f"idle_status={idle_status} retained_mib={mib(retained)}",
                 flush=True,
             )
+        run.update(gpu_time_fields(gpu_start, read_gpu_time(proc.pid)))
         run["footprint_lifetime_max_bytes"] = read_lifetime_max_footprint(proc.pid)
     abandoned = sum(1 for row in rows if row["abandoned_after_ms"] is not None)
     failed = sum(1 for row in rows if probe_failed(row))
@@ -822,9 +917,9 @@ REQUEST_ROW_KEYS = (
 )
 
 
-def entry_defect(row, keys: tuple, numbers: tuple) -> str | None:
+def entry_defect(row, keys: tuple, numbers: tuple, count: str = "documents") -> str | None:
     """What is wrong with `row` in the part every mode's rows share, or None:
-    every key in `keys` present, a usable `id`, an integer `documents`, and
+    every key in `keys` present, a usable `id`, an integer under `count`, and
     each key in `numbers` null or a finite number."""
     if not isinstance(row, dict):
         return "not a JSON object"
@@ -834,15 +929,15 @@ def entry_defect(row, keys: tuple, numbers: tuple) -> str | None:
     request_id = row["id"]
     if isinstance(request_id, bool) or not isinstance(request_id, (str, int)):
         return "`id` must be a string or an integer"
-    if type(row["documents"]) is not int:
-        return "`documents` must be an integer"
+    if type(row[count]) is not int:
+        return f"`{count}` must be an integer"
     for name in numbers:
         if row[name] is not None and not is_finite_number(row[name]):
             return f"`{name}` must be null or a finite number"
     return None
 
 
-def abandon_row_defect(row) -> str | None:
+def abandon_row_defect(row, count: str = "documents") -> str | None:
     """What makes an `abandon` row unusable for a comparison, or None.
 
     The error fields decide whether a probe failed, so each must be null or a
@@ -851,8 +946,9 @@ def abandon_row_defect(row) -> str | None:
     """
     defect = entry_defect(
         row,
-        ABANDON_ROW_KEYS,
+        ("id", count, *ABANDON_MEASURE_KEYS),
         ("abandoned_after_ms", "alone_wall_ms", "behind_wall_ms", "footprint_retained_bytes"),
+        count,
     )
     if defect:
         return defect
@@ -901,10 +997,13 @@ ROW_DEFECTS = {
 }
 
 
-def load_result(path: str) -> dict:
+def load_result(path: str, row_defects: dict = ROW_DEFECTS) -> dict:
     """Read and validate a replay, concurrent or abandon result file.
 
-    Error messages name the file and the entry's position, never its content.
+    `row_defects` holds the row check of each mode. A file written before
+    GPU time was recorded has no `gpu_time_ns`; where present it is null or
+    an integer. Error messages name the file and the entry's position, never
+    its content.
     """
     try:
         with open(path, encoding="utf-8") as fh:
@@ -916,10 +1015,15 @@ def load_result(path: str) -> dict:
     run = data.get("run") if isinstance(data, dict) else None
     rows = data.get("requests") if isinstance(data, dict) else None
     mode = run.get("mode") if isinstance(run, dict) else None
-    if not isinstance(mode, str) or mode not in ROW_DEFECTS or not isinstance(rows, list):
+    if not isinstance(mode, str) or mode not in row_defects or not isinstance(rows, list):
         raise InputError(f"{path}: not a replay, concurrent or abandon result file")
+    gpu_time = run.get("gpu_time_ns")
+    if gpu_time is not None and type(gpu_time) is not int:
+        raise InputError(f"{path}: `run.gpu_time_ns` must be null or an integer")
+    if not isinstance(run.get("gpu_time_source", ""), str):
+        raise InputError(f"{path}: `run.gpu_time_source` must be a string")
     for position, row in enumerate(rows, start=1):
-        defect = ROW_DEFECTS[mode](row)
+        defect = row_defects[mode](row)
         if defect:
             raise InputError(f"{path}: request entry {position}: {defect}")
     counts = collections.Counter(row["id"] for row in rows)
@@ -957,8 +1061,15 @@ def top_set(scores: list[float], cut: int) -> set[int]:
     return set(ranked[:cut])
 
 
-def compare_runs(before: dict, after: dict) -> dict:
-    """Differences, after minus before, over the requests both runs scored."""
+def pair_rows(before: dict, after: dict, result: str, mismatch: str) -> tuple[dict, list]:
+    """Pair the rows of two replay or concurrent result files by id.
+
+    Returns (report, pairs). The report counts the ids present in one file
+    only, those whose `result` is null on a side, and, under `mismatch`, those
+    whose `result` lists differ in length; none of them is paired. For the
+    (before, after) rows in `pairs` it holds the spreads of the wall time and
+    footprint differences, after minus before.
+    """
     before_rows = {row["id"]: row for row in before["requests"]}
     after_rows = {row["id"]: row for row in after["requests"]}
     shared = [request_id for request_id in before_rows if request_id in after_rows]
@@ -967,38 +1078,59 @@ def compare_runs(before: dict, after: dict) -> dict:
         "footprint_peak_bytes": [],
         "footprint_retained_bytes": [],
     }
-    failed = mismatched = compared = 0
-    max_abs_score_diff = None
-    changed = {cut: 0 for cut in TOP_CUTS}
+    failed = mismatched = 0
+    pairs = []
     for request_id in shared:
         b, a = before_rows[request_id], after_rows[request_id]
-        if not isinstance(b.get("scores"), list) or not isinstance(a.get("scores"), list):
+        if not isinstance(b.get(result), list) or not isinstance(a.get(result), list):
             failed += 1
             continue
-        if len(b["scores"]) != len(a["scores"]):
+        if len(b[result]) != len(a[result]):
             mismatched += 1
             continue
-        compared += 1
+        pairs.append((b, a))
         for name, values in deltas.items():
             if b.get(name) is not None and a.get(name) is not None:
                 values.append(a[name] - b[name])
+    report = {
+        "only_before": len(before_rows) - len(shared),
+        "only_after": len(after_rows) - len(shared),
+        "failed_on_a_side": failed,
+        mismatch: mismatched,
+        "compared": len(pairs),
+    }
+    for name, values in deltas.items():
+        report[name] = spread(values)
+    return report, pairs
+
+
+def compare_gpu_time(before: dict, after: dict) -> dict:
+    """The run GPU time of each file and after minus before, in ns; null
+    where a file has none."""
+    b, a = before["run"].get("gpu_time_ns"), after["run"].get("gpu_time_ns")
+    return {
+        "gpu_time_before_ns": b,
+        "gpu_time_after_ns": a,
+        "gpu_time_diff_ns": None if b is None or a is None else a - b,
+    }
+
+
+def compare_runs(before: dict, after: dict) -> dict:
+    """Differences, after minus before, over the requests both runs scored."""
+    report, pairs = pair_rows(before, after, "scores", "document_count_mismatch")
+    max_abs_score_diff = None
+    changed = {cut: 0 for cut in TOP_CUTS}
+    for b, a in pairs:
         diff = max(abs(x - y) for x, y in zip(a["scores"], b["scores"]))
         max_abs_score_diff = diff if max_abs_score_diff is None else max(max_abs_score_diff, diff)
         for cut in TOP_CUTS:
             if top_set(b["scores"], cut) != top_set(a["scores"], cut):
                 changed[cut] += 1
-    report = {
-        "only_before": len(before_rows) - len(shared),
-        "only_after": len(after_rows) - len(shared),
-        "failed_on_a_side": failed,
-        "document_count_mismatch": mismatched,
-        "compared": compared,
-        "max_abs_score_diff": max_abs_score_diff,
-    }
-    for name, values in deltas.items():
-        report[name] = spread(values)
+    compared = report["compared"]
+    report["max_abs_score_diff"] = max_abs_score_diff
     for cut in TOP_CUTS:
         report[f"top{cut}_changed_share"] = changed[cut] / compared if compared else None
+    report.update(compare_gpu_time(before, after))
     return report
 
 
@@ -1038,6 +1170,7 @@ def compare_abandon_runs(before: dict, after: dict) -> dict:
     }
     for name, series in values.items():
         report[name] = spread(series)
+    report.update(compare_gpu_time(before, after))
     return report
 
 
@@ -1053,16 +1186,49 @@ def format_spread(
     return f"{label} ({unit}, n={stats['n']}): {parts}"
 
 
-def print_abandon_comparison(args: argparse.Namespace, before: dict, after: dict) -> None:
+def print_headers(args: argparse.Namespace, before: dict, after: dict, names: tuple) -> None:
+    """One line per file: its path, the `run` fields in `names`, the row count."""
     for label, path, data in (("before", args.before, before), ("after", args.after, after)):
         run = data["run"]
-        print(
-            f"{label}: {path}  commit={run.get('commit')} date={run.get('date')} "
-            f"abandon_after_s={run.get('abandon_after_s')} "
-            f"min_documents={run.get('min_documents')} "
-            f"probe_documents={run.get('probe_documents')} "
-            f"live_traffic={run.get('live_traffic')} requests={len(data['requests'])}"
+        fields = " ".join(f"{name}={run.get(name)}" for name in names)
+        print(f"{label}: {path}  {fields} requests={len(data['requests'])}")
+
+
+def print_deltas(report: dict) -> None:
+    """The wall time and footprint spreads of a `pair_rows` report."""
+    print()
+    print("differences are after minus before")
+    print(format_spread("wall time", report["wall_ms"], 1.0, "ms"))
+    print(format_spread("peak footprint", report["footprint_peak_bytes"], 1024**2, "MiB"))
+    print(
+        format_spread(
+            "retained footprint", report["footprint_retained_bytes"], 1024**2, "MiB"
         )
+    )
+
+
+def print_gpu_time(report: dict, before: dict, after: dict) -> None:
+    """The `compare_gpu_time` part of a report, with each file's source."""
+    print()
+    print("server GPU time over the whole run")
+    for side, data in (("before", before), ("after", after)):
+        value = report[f"gpu_time_{side}_ns"]
+        source = data["run"].get("gpu_time_source", "not recorded")
+        shown = "n/a" if value is None else f"{value / 1e6:.2f} ms"
+        print(f"{side}: {shown} ({source})")
+    diff = report["gpu_time_diff_ns"]
+    print("after minus before: " + ("n/a" if diff is None else f"{diff / 1e6:+.2f} ms"))
+
+
+def print_abandon_comparison(
+    args: argparse.Namespace, before: dict, after: dict, count: str = "documents"
+) -> None:
+    print_headers(
+        args,
+        before,
+        after,
+        ("commit", "date", "abandon_after_s", f"min_{count}", f"probe_{count}", "live_traffic"),
+    )
     report = compare_abandon_runs(before, after)
     print()
     print(
@@ -1083,27 +1249,34 @@ def print_abandon_comparison(args: argparse.Namespace, before: dict, after: dict
         print(format_spread("before", report[f"{probe}_before"], 1.0, "ms", sign=""))
         print(format_spread("after", report[f"{probe}_after"], 1.0, "ms", sign=""))
         print(format_spread("after minus before", report[f"{probe}_diff"], 1.0, "ms"))
+    print_gpu_time(report, before, after)
+
+
+# The `run` fields `compare` prints for a replay or concurrent file.
+REPLAY_HEADER_FIELDS = ("commit", "date", "in_flight", "live_traffic")
+
+
+def load_pair(args: argparse.Namespace, row_defects: dict = ROW_DEFECTS) -> tuple[dict, dict, bool]:
+    """Load `--before` and `--after`. Returns (before, after, abandon), where
+    `abandon` says both are abandon results; refuses a pair in which only one
+    of them is."""
+    before, after = load_result(args.before, row_defects), load_result(args.after, row_defects)
+    modes = [data["run"]["mode"] for data in (before, after)]
+    if "abandon" in modes and modes != ["abandon", "abandon"]:
+        raise InputError(
+            f"{args.before} holds {modes[0]} results and {args.after} holds "
+            f"{modes[1]} results; abandon results compare only with other "
+            "abandon results"
+        )
+    return before, after, "abandon" in modes
 
 
 def run_compare(args: argparse.Namespace) -> int:
-    before, after = load_result(args.before), load_result(args.after)
-    modes = [data["run"]["mode"] for data in (before, after)]
-    if "abandon" in modes:
-        if modes != ["abandon", "abandon"]:
-            raise InputError(
-                f"{args.before} holds {modes[0]} results and {args.after} holds "
-                f"{modes[1]} results; abandon results compare only with other "
-                "abandon results"
-            )
+    before, after, abandon = load_pair(args)
+    if abandon:
         print_abandon_comparison(args, before, after)
         return 0
-    for label, path, data in (("before", args.before, before), ("after", args.after, after)):
-        run = data["run"]
-        print(
-            f"{label}: {path}  commit={run.get('commit')} date={run.get('date')} "
-            f"in_flight={run.get('in_flight')} live_traffic={run.get('live_traffic')} "
-            f"requests={len(data['requests'])}"
-        )
+    print_headers(args, before, after, REPLAY_HEADER_FIELDS)
     report = compare_runs(before, after)
     print()
     print(f"compared: {report['compared']} requests scored in both files")
@@ -1112,16 +1285,10 @@ def run_compare(args: argparse.Namespace) -> int:
     )
     print(f"failed in at least one file: {report['failed_on_a_side']}")
     print(f"different document count under one id: {report['document_count_mismatch']}")
-    print()
-    print("differences are after minus before")
-    print(format_spread("wall time", report["wall_ms"], 1.0, "ms"))
-    print(format_spread("peak footprint", report["footprint_peak_bytes"], 1024**2, "MiB"))
-    print(
-        format_spread(
-            "retained footprint", report["footprint_retained_bytes"], 1024**2, "MiB"
-        )
-    )
+    print_deltas(report)
+    print_gpu_time(report, before, after)
     if report["compared"]:
+        print()
         print(f"max absolute score difference: {report['max_abs_score_diff']:.6g}")
         for cut in TOP_CUTS:
             share = report[f"top{cut}_changed_share"]
@@ -1160,12 +1327,8 @@ def positive_seconds(text: str) -> float:
     return value
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    modes = parser.add_subparsers(dest="mode", required=True)
-
+def server_options(server_args_example: str) -> argparse.ArgumentParser:
+    """The options every measuring mode takes, as a parent parser."""
     server = argparse.ArgumentParser(add_help=False)
     server.add_argument("--bin", required=True, help="server binary to start")
     server.add_argument(
@@ -1174,7 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "arguments for the server, as one string in the = form, for example "
-            '--server-args="-m <dir> --reranker-model <dir>"; --host and --port are added'
+            f'--server-args="{server_args_example}"; --host and --port are added'
         ),
     )
     server.add_argument(
@@ -1207,6 +1370,15 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("yes", "no", "unknown"),
         help="whether other traffic was using the same GPU during the run",
     )
+    return server
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    modes = parser.add_subparsers(dest="mode", required=True)
+    server = server_options("-m <dir> --reranker-model <dir>")
 
     replay = modes.add_parser(
         "replay", parents=[server], help="send the requests one at a time"

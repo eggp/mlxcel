@@ -16,14 +16,17 @@
 
 The server is a stub: a short Python program this file writes to the system
 temp directory and the tool starts in place of mlxcel-server. It scores
-"synthetic doc N" as N/100, so every expected score is known. No model, GPU or
-network beyond the loopback socket is involved.
+"synthetic doc N" as N/100, so every expected score is known. `ioreg` is a
+stub too, the only one on PATH, so the real command is never run. No model,
+GPU or network beyond the loopback socket is involved.
 
 Run with:
     python3 -m unittest tests/test_bench_rerank_replay.py -v
 """
 
+import argparse
 import contextlib
+import functools
 import io
 import json
 import math
@@ -156,6 +159,89 @@ REQUESTS = [
 REQUEST_TEXTS = [r["query"] for r in REQUESTS] + [d for r in REQUESTS for d in r["documents"]]
 ON_MACOS = sys.platform == "darwin"
 
+# Stands in for `ioreg -r -w 0 -c AGXDeviceUserClient`, in the layout the real
+# command prints. In the directory STUB_IOREG_STATE names it reads the started
+# server's pid from `server.pid` and what to do from `mode` ("ok" when absent,
+# "no-client" or "fails"), and counts its calls in `calls`. Under "ok" the
+# server owns four clients: one with two usage entries, one with an empty
+# usage list, one without any, and one more with usage, 1500 ns per call plus
+# 7 in all, so a run, which reads twice, records 1500 ns. Clients of two other
+# processes, one whose pid begins with the server's, are listed in every mode.
+STUB_IOREG = r'''
+import os, sys
+
+here = os.environ["STUB_IOREG_STATE"]
+
+
+def read(name, default):
+    try:
+        with open(os.path.join(here, name)) as fh:
+            return fh.read().strip()
+    except FileNotFoundError:
+        return default
+
+
+mode = read("mode", "ok")
+if mode == "fails":
+    sys.stderr.write("ioreg: stub failure\n")
+    sys.exit(1)
+calls = int(read("calls", "0")) + 1
+with open(os.path.join(here, "calls"), "w") as fh:
+    fh.write(str(calls))
+pid = int(read("server.pid", "0"))
+
+
+def client(number, owner_pid, name, usage):
+    lines = [
+        "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x%x, !registered, "
+        "!matched, active, busy 0, retain 5>" % (0x100000000 + number),
+        "    {",
+    ]
+    if usage is not None:
+        entries = ",".join(
+            '{"API"="Metal","lastSubmittedTime"=1700816668322916,"accumulatedGPUTime"=%d}' % ns
+            for ns in usage
+        )
+        lines.append('      "AppUsage" = (%s)' % entries)
+    lines.append('      "IOUserClientCreator" = "pid %d, %s"' % (owner_pid, name))
+    lines += ["    }", "    ", ""]
+    return "\n".join(lines)
+
+
+clients = [client(1, 1, "launchd", [10**12]), client(2, pid * 10 + 1, "other", [10**9])]
+if mode == "ok":
+    clients += [
+        client(3, pid, "mlxcel-server", [1000 * calls, 7]),
+        client(4, pid, "mlxcel-server", []),
+        client(5, pid, "mlxcel-server", None),
+        client(6, pid, "mlxcel-server", [500 * calls]),
+    ]
+print("\n".join(clients))
+'''
+STUB_GPU_TIME_NS = 1500
+# How the stub `ioreg` is broken, and the `gpu_time_source` a run then records.
+GPU_TIME_FAILURES = {
+    "missing": "unavailable: ioreg not found",
+    "fails": "unavailable: ioreg failed",
+    "no-client": "unavailable: no GPU client of the server process",
+}
+# Keeps the stub `ioreg` directory until the test process exits.
+_KEEP = []
+
+
+@functools.cache
+def stub_ioreg_bin() -> pathlib.Path:
+    """A directory in the system temp directory holding only the stub `ioreg`,
+    written once per test process: the first run of a newly written
+    executable took about half a second on macOS, later runs a few ms."""
+    holder = tempfile.TemporaryDirectory()
+    _KEEP.append(holder)
+    directory = pathlib.Path(holder.name)
+    ioreg = directory / "ioreg"
+    ioreg.write_text(f"#!{sys.executable}\n{STUB_IOREG}", encoding="utf-8")
+    ioreg.chmod(0o755)
+    return directory
+
 
 def free_port() -> int:
     with socket.socket() as sock:
@@ -164,16 +250,23 @@ def free_port() -> int:
 
 
 class ToolTestCase(unittest.TestCase):
-    """Runs the tool's `main` against the stub server in a temp directory."""
+    """Runs the tool's `main` against the stub server in a temp directory,
+    with the stub `ioreg` alone on PATH."""
+
+    TOOL = brr
+    STUB = STUB_SERVER
+    REQUESTS = REQUESTS
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.tmp = pathlib.Path(tmp.name)
         self.stub = self.tmp / "stub_server.py"
-        self.stub.write_text(STUB_SERVER, encoding="utf-8")
-        self.requests = self.write_requests(REQUESTS)
+        self.stub.write_text(self.STUB, encoding="utf-8")
+        self.requests = self.write_requests(self.REQUESTS)
         self.out = self.tmp / "result.json"
+        self.ioreg_state = self.tmp / "ioreg"
+        self.ioreg_state.mkdir()
         self.started = []
         real_popen = subprocess.Popen
 
@@ -181,12 +274,17 @@ class ToolTestCase(unittest.TestCase):
             proc = real_popen(command, *args, **kwargs)
             if "--port" in command:
                 self.started.append(proc)
+                (self.ioreg_state / "server.pid").write_text(str(proc.pid), encoding="utf-8")
             return proc
 
         for patcher in (
             mock.patch.object(brr.subprocess, "Popen", side_effect=recording_popen),
             mock.patch.object(brr, "READY_TIMEOUT_S", 60.0),
             mock.patch.object(brr, "READY_POLL_S", 0.02),
+            mock.patch.dict(
+                os.environ,
+                {"PATH": str(stub_ioreg_bin()), "STUB_IOREG_STATE": str(self.ioreg_state)},
+            ),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -195,6 +293,23 @@ class ToolTestCase(unittest.TestCase):
         path = self.tmp / name
         path.write_text("".join(json.dumps(r) + "\n" for r in requests), encoding="utf-8")
         return path
+
+    @contextlib.contextmanager
+    def ioreg_broken(self, how):
+        """`ioreg` missing from PATH, exiting non-zero, or listing no client
+        of the server, one key of GPU_TIME_FAILURES."""
+        if how == "missing":
+            empty = self.tmp / "empty-bin"
+            empty.mkdir(exist_ok=True)
+            with mock.patch.dict(os.environ, {"PATH": str(empty)}):
+                yield
+            return
+        mode = self.ioreg_state / "mode"
+        mode.write_text(how, encoding="utf-8")
+        try:
+            yield
+        finally:
+            mode.unlink()
 
     def run_tool(
         self, mode, stub_mode="ok", extra=(), out=None, binary=sys.executable, port=None
@@ -217,7 +332,7 @@ class ToolTestCase(unittest.TestCase):
     def run_main(self, argv, out=None):
         stdout, stderr = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            code = brr.main(argv)
+            code = self.TOOL.main(argv)
         result = None
         if out is not None and out.is_file():
             result = json.loads(out.read_text(encoding="utf-8"))
@@ -1575,6 +1690,196 @@ class AbandonCompareTest(ToolTestCase):
         self.assertEqual(code, 0)
         self.assertIn("compared: 2 large requests abandoned in both files", stdout)
         self.assertIn("failed probe in at least one file: 0", stdout)
+
+
+def gpu_client(owner, usage):
+    """One client entry as `ioreg -r -w 0 -c AGXDeviceUserClient` prints it;
+    `usage` None leaves out the `AppUsage` line."""
+    lines = [
+        "+-o AGXDeviceUserClient  <class AGXDeviceUserClient, id 0x1000011aa, "
+        "!registered, !matched, active, busy 0, retain 5>",
+        "    {",
+    ]
+    if usage is not None:
+        entries = ",".join(
+            '{"API"="Metal","lastSubmittedTime"=1700816668322916,"accumulatedGPUTime"=%d}' % ns
+            for ns in usage
+        )
+        lines.append(f'      "AppUsage" = ({entries})')
+    lines += [f'      "IOUserClientCreator" = "{owner}"', "    }", "    ", ""]
+    return "\n".join(lines)
+
+
+GPU_LISTING = "\n".join(
+    [
+        gpu_client("pid 4242, mlxcel-server", [129172208083, 17]),
+        gpu_client("pid 4242, mlxcel-server", None),
+        gpu_client("pid 4242, mlxcel-server", []),
+        gpu_client("pid 42420, other", [5000]),
+        gpu_client("pid 4242, mlxcel-server", [100]),
+        gpu_client("pid 1, launchd", [7]),
+    ]
+)
+
+
+class GpuTimeTest(ToolTestCase):
+    def test_sums_every_usage_entry_over_the_clients_of_one_pid(self):
+        self.assertEqual(brr.gpu_time_in(GPU_LISTING, 4242), 129172208083 + 17 + 100)
+        self.assertEqual(brr.gpu_time_in(GPU_LISTING, 42420), 5000)
+
+    def test_clients_without_usage_count_as_zero_and_a_pid_without_clients_as_none(self):
+        no_usage = gpu_client("pid 4242, mlxcel-server", None) + gpu_client(
+            "pid 4242, mlxcel-server", []
+        )
+        self.assertEqual(brr.gpu_time_in(no_usage, 4242), 0)
+        self.assertIsNone(brr.gpu_time_in(GPU_LISTING, 424))
+        self.assertIsNone(brr.gpu_time_in("", 4242))
+
+    def test_runs_record_the_server_gpu_time(self):
+        for mode, extra in (
+            ("replay", []),
+            ("concurrent", ["--in-flight", "2"]),
+            ("abandon", ["--abandon-after", "30", "--min-documents", "3"]),
+        ):
+            with self.subTest(mode=mode):
+                code, _, _, result = self.run_tool(mode, extra=extra)
+                self.assertEqual(code, 0)
+                self.assertEqual(result["run"]["gpu_time_ns"], STUB_GPU_TIME_NS)
+                self.assertEqual(result["run"]["gpu_time_source"], "ioreg")
+
+    def test_unreadable_gpu_time_is_null_with_the_reason_and_the_run_completes(self):
+        for how, source in GPU_TIME_FAILURES.items():
+            for mode, extra in (
+                ("replay", []),
+                ("abandon", ["--abandon-after", "30", "--min-documents", "3"]),
+            ):
+                with self.subTest(how=how, mode=mode), self.ioreg_broken(how):
+                    code, _, _, result = self.run_tool(mode, extra=extra)
+                    self.assertEqual(code, 0)
+                    self.assertIsNone(result["run"]["gpu_time_ns"])
+                    self.assertEqual(result["run"]["gpu_time_source"], source)
+                    self.assertEqual(len(result["requests"]), 4 if mode == "replay" else 2)
+
+    def write_json(self, name, data):
+        path = self.tmp / name
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def compare(self, before, after):
+        return self.run_main(
+            ["compare", "--before", str(self.write_json("before.json", before)),
+             "--after", str(self.write_json("after.json", after))]
+        )
+
+    @staticmethod
+    def with_gpu_time(data, ns, source="ioreg"):
+        return {**data, "run": {**data["run"], "gpu_time_ns": ns, "gpu_time_source": source}}
+
+    def test_compare_reports_the_gpu_time_of_both_runs_and_the_difference(self):
+        for before, after in ((BEFORE, AFTER), (ABANDON_BEFORE, ABANDON_AFTER)):
+            with self.subTest(mode=before["run"]["mode"]):
+                code, stdout, _, _ = self.compare(
+                    self.with_gpu_time(before, 2_500_000_000),
+                    self.with_gpu_time(after, 2_000_000_000),
+                )
+                self.assertEqual(code, 0)
+                self.assertIn(
+                    "server GPU time over the whole run\n"
+                    "before: 2500.00 ms (ioreg)\n"
+                    "after: 2000.00 ms (ioreg)\n"
+                    "after minus before: -500.00 ms\n",
+                    stdout,
+                )
+        report = brr.compare_runs(
+            self.with_gpu_time(BEFORE, 2_500_000_000), self.with_gpu_time(AFTER, 2_000_000_000)
+        )
+        self.assertEqual(
+            (report["gpu_time_before_ns"], report["gpu_time_after_ns"], report["gpu_time_diff_ns"]),
+            (2_500_000_000, 2_000_000_000, -500_000_000),
+        )
+
+    def test_compare_without_a_gpu_time_on_a_side_reports_no_difference(self):
+        code, stdout, _, _ = self.compare(
+            self.with_gpu_time(BEFORE, None, "unavailable: ioreg not found"), AFTER
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("before: n/a (unavailable: ioreg not found)\n", stdout)
+        self.assertIn("after: n/a (not recorded)\n", stdout)
+        self.assertIn("after minus before: n/a\n", stdout)
+
+    def test_two_replays_of_the_stub_compare_their_gpu_time(self):
+        first, second = self.tmp / "first.json", self.tmp / "second.json"
+        self.assertEqual(self.run_tool("replay", out=first)[0], 0)
+        self.assertEqual(self.run_tool("replay", out=second)[0], 0)
+        code, stdout, _, _ = self.run_main(
+            ["compare", "--before", str(first), "--after", str(second)]
+        )
+        self.assertEqual(code, 0)
+        self.assertIn("after minus before: +0.00 ms\n", stdout)
+
+    def test_result_file_with_a_malformed_gpu_time_is_refused(self):
+        for ns, source, message in (
+            ("1500", "ioreg", "`run.gpu_time_ns` must be null or an integer"),
+            (1.5, "ioreg", "`run.gpu_time_ns` must be null or an integer"),
+            (True, "ioreg", "`run.gpu_time_ns` must be null or an integer"),
+            (1500, 7, "`run.gpu_time_source` must be a string"),
+        ):
+            with self.subTest(ns=ns, source=source):
+                code, _, stderr, _ = self.compare(BEFORE, self.with_gpu_time(AFTER, ns, source))
+                self.assertEqual(code, 2)
+                self.assertIn(f"error: {self.tmp / 'after.json'}: {message}", stderr)
+
+
+def long_options(parser) -> dict:
+    """The long options of each mode of `parser`, `--help` left out."""
+    modes = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    return {
+        mode: {
+            option
+            for action in sub._actions
+            for option in action.option_strings
+            if option.startswith("--") and option != "--help"
+        }
+        for mode, sub in modes.choices.items()
+    }
+
+
+def help_text(tool, argv) -> str:
+    stdout = io.StringIO()
+    with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(io.StringIO()):
+        try:
+            tool.main(argv)
+        except SystemExit as exc:
+            if exc.code != 0:
+                raise
+    return stdout.getvalue()
+
+
+SERVER_OPTIONS = {
+    "--bin", "--server-args", "--env", "--port", "--requests", "--out", "--commit",
+    "--live-traffic",
+}
+
+
+class HelpTest(unittest.TestCase):
+    TOOL = brr
+    OPTIONS = {
+        "replay": SERVER_OPTIONS,
+        "concurrent": SERVER_OPTIONS | {"--in-flight"},
+        "startup": SERVER_OPTIONS | {"--starts", "--page-cache"},
+        "abandon": SERVER_OPTIONS | {"--abandon-after", "--min-documents"},
+        "compare": {"--before", "--after"},
+    }
+
+    def test_every_mode_is_in_the_help_and_every_long_option_in_its_mode_help(self):
+        self.assertEqual(long_options(self.TOOL.build_parser()), self.OPTIONS)
+        top = help_text(self.TOOL, ["--help"])
+        for mode, options in self.OPTIONS.items():
+            with self.subTest(mode=mode):
+                self.assertIn(mode, top)
+                text = help_text(self.TOOL, [mode, "--help"])
+                for option in options:
+                    self.assertIn(option, text)
 
 
 if __name__ == "__main__":
