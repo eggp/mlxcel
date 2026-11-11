@@ -93,7 +93,8 @@ def read_state(name):
 
 def busy_until_seen(nth):
     """Under "busy-footprint", hold request `nth` until a footprint reading
-    has seen it in flight, see ToolTestCase.footprint_seen_while_busy."""
+    taken in flight has been folded into the open window, see
+    ToolTestCase.footprint_seen_while_busy."""
     put("busy", str(nth))
     deadline = time.monotonic() + 10
     while read_state("seen") != str(nth) and time.monotonic() < deadline:

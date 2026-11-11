@@ -94,7 +94,8 @@ def read_state(name):
 
 def busy_until_seen(nth):
     """Under "busy-footprint", hold request `nth` until a footprint reading
-    has seen it in flight, see ToolTestCase.footprint_seen_while_busy."""
+    taken in flight has been folded into the open window, see
+    ToolTestCase.footprint_seen_while_busy."""
     put("busy", str(nth))
     deadline = time.monotonic() + 10
     while read_state("seen") != str(nth) and time.monotonic() < deadline:
@@ -350,17 +351,26 @@ class ToolTestCase(unittest.TestCase):
 
     def footprint_seen_while_busy(self):
         """Fakes the footprint reading for the stub server's "busy-footprint"
-        mode: FOOTPRINT_BUSY while the stub holds a request, which it does
-        until a reading has seen it, and FOOTPRINT_IDLE at any other time. A
-        footprint window therefore peaks at FOOTPRINT_BUSY only when it is
-        open while the request is in flight."""
+        mode: FOOTPRINT_BUSY while the stub holds a request, and
+        FOOTPRINT_IDLE at any other time. A footprint window therefore peaks
+        at FOOTPRINT_BUSY only when it is open while the request is in flight.
+
+        The stub holds a request until it is marked seen, which happens on its
+        second busy reading, not its first: while the request is in flight
+        only the sampler thread reads, and it folds one reading into the open
+        windows before it takes the next, so the first busy reading is
+        already folded when the request is released, however slow the
+        threads run."""
+        busy_readings = {}
 
         def read_footprint(pid):
             try:
                 nth = (self.ioreg_state / "busy").read_text(encoding="utf-8")
             except FileNotFoundError:
                 return FOOTPRINT_IDLE
-            (self.ioreg_state / "seen").write_text(nth, encoding="utf-8")
+            busy_readings[nth] = busy_readings.get(nth, 0) + 1
+            if busy_readings[nth] > 1:
+                (self.ioreg_state / "seen").write_text(nth, encoding="utf-8")
             return FOOTPRINT_BUSY
 
         return mock.patch.object(brr, "read_footprint", side_effect=read_footprint)
