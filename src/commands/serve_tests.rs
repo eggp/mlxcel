@@ -64,6 +64,7 @@ fn sample_args() -> crate::ServeArgs {
         embedding_model: None,
         image_model: None,
         embedding_batch_size: 16,
+        embedding_token_budget: 4096,
         embedding_max_length: None,
         embedding_queue_depth: 8,
         embedding_request_timeout_secs: 120,
@@ -358,6 +359,19 @@ fn build_startup_input_propagates_image_limits() {
     assert_eq!(input.max_image_width, 2048);
     assert_eq!(input.max_image_height, 1024);
     assert_eq!(input.max_image_decode_alloc_bytes, 16 * 1024 * 1024);
+}
+
+#[test]
+fn build_startup_input_propagates_embedding_token_budget() {
+    let mut args = sample_args();
+    args.embedding_token_budget = 1234;
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(input.embedding_token_budget, 1234);
+
+    let mut args = sample_args();
+    args.embedding_token_budget = 0;
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(input.embedding_token_budget, 0);
 }
 
 #[test]

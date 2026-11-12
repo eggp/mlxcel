@@ -222,9 +222,8 @@ pub fn create_bidirectional_padding_mask(mask: &MlxArray) -> UniquePtr<MlxArray>
 /// finite. Padding-row outputs are garbage-but-finite and are never consumed,
 /// because those key positions stay blocked for every real query.
 ///
-/// Used by: the last-token embedding families (Qwen3-Embedding without
-/// bidirectional attention, Qwen3-VL-Embedding) and any batched causal
-/// prefill over a padded `[B, L]` input.
+/// Used by: the last-token embedding family Qwen3-VL-Embedding and any
+/// batched causal prefill over a padded `[B, L]` input.
 pub fn create_causal_padding_mask(mask: &MlxArray, offset: i32) -> UniquePtr<MlxArray> {
     let (b, total) = padding_mask_shape(mask, "create_causal_padding_mask");
     assert!(

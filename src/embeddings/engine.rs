@@ -20,6 +20,8 @@
 //! thread. Everything MLX-related stays inside; callers only see plain
 //! `Vec<f32>` vectors and token counts.
 
+use std::ops::Range;
+
 use mlxcel_core::{MlxArray, UniquePtr, dtype, utils::array_to_vec_f32};
 use thiserror::Error;
 
@@ -31,8 +33,37 @@ use super::normalize::{EmbdNormalize, apply_embd_normalize};
 use super::pooling::truncate_dimensions;
 use super::tokenize::{EncodeOptions, EncodedBatch, EncodedRow, encode_row, truncate_token_ids};
 
-/// Default `--embedding-batch-size`: texts per forward pass.
+/// Default `--embedding-batch-size`: most texts per forward pass.
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 16;
+
+/// Default `--embedding-token-budget`: padded tokens (rows x the longest
+/// padded length) per forward pass.
+pub const DEFAULT_EMBEDDING_TOKEN_BUDGET: usize = 4096;
+
+/// Cut ascending padded row lengths into consecutive micro-batches of at most
+/// `batch_size` rows and, with a `token_budget`, at most that many padded
+/// tokens (rows x the last, longest length). A micro-batch always holds at
+/// least one row, even when that row alone exceeds the budget.
+pub(super) fn micro_batch_bounds(
+    sorted_lengths: &[usize],
+    batch_size: usize,
+    token_budget: Option<usize>,
+) -> Vec<Range<usize>> {
+    let mut bounds = Vec::new();
+    let mut start = 0;
+    for (end, &len) in sorted_lengths.iter().enumerate() {
+        let rows = end - start + 1;
+        let over_budget = token_budget.is_some_and(|budget| rows.saturating_mul(len) > budget);
+        if end > start && (rows > batch_size || over_budget) {
+            bounds.push(start..end);
+            start = end;
+        }
+    }
+    if start < sorted_lengths.len() {
+        bounds.push(start..sorted_lengths.len());
+    }
+    bounds
+}
 
 /// Failure modes of one engine call.
 #[derive(Debug, Error)]
@@ -115,15 +146,26 @@ pub struct EmbedReply {
 pub struct EmbeddingEngine {
     loaded: LoadedEmbeddingModel,
     batch_size: usize,
+    token_budget: Option<usize>,
 }
 
 impl EmbeddingEngine {
-    /// Wrap a loaded model. `batch_size` is clamped to at least one.
+    /// Wrap a loaded model with [`DEFAULT_EMBEDDING_TOKEN_BUDGET`].
+    /// `batch_size` is clamped to at least one.
     pub fn new(loaded: LoadedEmbeddingModel, batch_size: usize) -> Self {
         Self {
             loaded,
             batch_size: batch_size.max(1),
+            token_budget: Some(DEFAULT_EMBEDDING_TOKEN_BUDGET),
         }
+    }
+
+    /// Replace the padded-token budget per micro-batch; `0` turns it off and
+    /// leaves the cut to `batch_size` alone.
+    #[must_use]
+    pub fn with_token_budget(mut self, token_budget: usize) -> Self {
+        self.token_budget = (token_budget > 0).then_some(token_budget);
+        self
     }
 
     /// The pooling this checkpoint resolved, for `/props` (#1452).
@@ -162,9 +204,14 @@ impl EmbeddingEngine {
         self.loaded.model_type
     }
 
-    /// Texts per forward pass.
+    /// Most texts per forward pass.
     pub fn batch_size(&self) -> usize {
         self.batch_size
+    }
+
+    /// Most padded tokens per forward pass; `None` when the budget is off.
+    pub fn token_budget(&self) -> Option<usize> {
+        self.token_budget
     }
 
     /// Fold the per-request options and the checkpoint's own `normalize` flag
@@ -322,14 +369,17 @@ impl EmbeddingEngine {
         let mut order: Vec<usize> = (0..rows.len()).collect();
         order.sort_by_key(|&i| rows[i].ids.len());
 
+        let pad_to = self.loaded.model.pad_to_max_length();
+        let padded_lengths: Vec<usize> = order
+            .iter()
+            .map(|&i| rows[i].ids.len().max(pad_to.unwrap_or(0)))
+            .collect();
+
         let mut vectors: Vec<Option<EmbeddingVector>> = (0..rows.len()).map(|_| None).collect();
-        for chunk in order.chunks(self.batch_size) {
+        for range in micro_batch_bounds(&padded_lengths, self.batch_size, self.token_budget) {
+            let chunk = &order[range];
             let chunk_rows: Vec<EncodedRow> = chunk.iter().map(|&i| rows[i].clone()).collect();
-            let batch = EncodedBatch::from_rows(
-                &chunk_rows,
-                self.loaded.pad_token_id,
-                self.loaded.model.pad_to_max_length(),
-            );
+            let batch = EncodedBatch::from_rows(&chunk_rows, self.loaded.pad_token_id, pad_to);
             let produced = self.forward_batch(&batch, images, post)?;
             for (&index, vector) in chunk.iter().zip(produced) {
                 vectors[index] = Some(vector);

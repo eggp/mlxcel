@@ -25,11 +25,12 @@
 //! soft-skips when it is not downloaded.
 
 use anyhow::Result;
+use mlxcel_core::utils::create_causal_padding_mask;
 use mlxcel_core::weights::WeightMap;
 
 use super::Qwen3EmbeddingModel;
 use crate::embeddings::model::{EmbeddingBatch, EmbeddingModel};
-use crate::embeddings::pooling::PoolingMode;
+use crate::embeddings::pooling::{PoolingMode, pool};
 use crate::models::embedding_test_support::{
     Rng, cosine, err_string, ids_array, local_checkpoint, max_abs_diff, mlx_test_guard, to_vec,
 };
@@ -151,10 +152,26 @@ fn ramp(len: usize) -> Vec<i32> {
 
 /// `[L, HIDDEN]` hidden states of one unpadded row.
 fn hidden_states(model: &Qwen3EmbeddingModel, ids: &[i32]) -> Vec<f32> {
-    let length = ids.len() as i32;
-    let input = ids_array(ids, 1, length);
-    let mask = ids_array(&vec![1; ids.len()], 1, length);
-    to_vec(&model.forward_hidden(&input, &mask))
+    let input = ids_array(ids, 1, ids.len() as i32);
+    to_vec(&model.forward_hidden(&input))
+}
+
+/// Pooled `[B, HIDDEN]` vectors of one `[B, width]` batch through `embed`.
+fn pooled(model: &Qwen3EmbeddingModel, ids: &[i32], mask: &[i32], width: usize) -> Vec<f32> {
+    let batch = (ids.len() / width) as i32;
+    let input_ids = ids_array(ids, batch, width as i32);
+    let attention_mask = ids_array(mask, batch, width as i32);
+    to_vec(
+        &model
+            .embed(&EmbeddingBatch {
+                input_ids: &input_ids,
+                attention_mask: &attention_mask,
+                token_type_ids: None,
+                images: None,
+            })
+            .unwrap()
+            .embeddings,
+    )
 }
 
 // Backbone refactor.
@@ -205,7 +222,7 @@ fn causal_prefill_is_causal() {
     let moved = max_abs_diff(&baseline[..earlier], &perturbed[..earlier]);
     assert!(
         moved < 1e-6,
-        "an earlier token reacted to the last token ({moved}); the mask is not causal"
+        "an earlier token reacted to the last token ({moved}); the forward pass is not causal"
     );
     let last = max_abs_diff(&baseline[earlier..], &perturbed[earlier..]);
     assert!(
@@ -263,6 +280,103 @@ fn last_token_pool_uses_appended_eos() {
     assert_eq!(alone_values.len(), HIDDEN);
     assert_eq!(batch_values.len(), 2 * HIDDEN);
     assert!(max_abs_diff(&alone_values, &batch_values[..HIDDEN]) < 1e-4);
+}
+
+#[test]
+fn mask_free_batch_matches_solo_rows_and_the_masked_path() {
+    let _guard = mlx_test_guard();
+    // The forward pass builds no mask array. In a right-padded batch every
+    // real row must still get the vector it gets alone, and the vector the
+    // explicit causal-and-padding mask gives.
+    const WIDTH: usize = 12;
+    // Rounding only: the three runs are the same f32 math through different
+    // batch shapes and attention routes. Measured on Metal, the spread is at
+    // most 1.5e-8 on components of magnitude up to 0.14, so the tolerance
+    // leaves room for another backend's rounding. A padding key that reaches
+    // a real row moves its vector by at least 2.2e-3, which the left-padded
+    // control below pins, so the tolerance cannot hide a leak.
+    const TOLERANCE: f32 = 1e-5;
+    const LEAK: f32 = 1e-3;
+
+    let args = tiny_args(2);
+    let model = build(&args, &tiny_weights(&args)).unwrap();
+
+    // One token, two partly padded rows, and one row that fills the width.
+    let rows: Vec<Vec<i32>> = [1_usize, 5, 9, WIDTH]
+        .iter()
+        .enumerate()
+        .map(|(r, &len)| {
+            (0..len)
+                .map(|i| ((i * (r + 3) + 2 * r + 1) % VOCAB) as i32)
+                .collect()
+        })
+        .collect();
+
+    let mut right_ids = Vec::new();
+    let mut right_mask = Vec::new();
+    let mut left_ids = Vec::new();
+    let mut left_mask = Vec::new();
+    for row in &rows {
+        let padding = WIDTH - row.len();
+        right_ids.extend_from_slice(row);
+        right_ids.extend(std::iter::repeat_n(0, padding));
+        right_mask.extend(std::iter::repeat_n(1, row.len()));
+        right_mask.extend(std::iter::repeat_n(0, padding));
+        left_ids.extend(std::iter::repeat_n(0, padding));
+        left_ids.extend_from_slice(row);
+        left_mask.extend(std::iter::repeat_n(0, padding));
+        left_mask.extend(std::iter::repeat_n(1, row.len()));
+    }
+
+    let batch = pooled(&model, &right_ids, &right_mask, WIDTH);
+
+    let batch_ids = ids_array(&right_ids, rows.len() as i32, WIDTH as i32);
+    let batch_mask = ids_array(&right_mask, rows.len() as i32, WIDTH as i32);
+    let mut caches = model.model.make_caches();
+    let masked_hidden = model.model.forward_hidden(
+        &batch_ids,
+        None,
+        &mut caches,
+        Some(&create_causal_padding_mask(&batch_mask, 0)),
+    );
+    let masked = to_vec(&pool(&masked_hidden, &batch_mask, PoolingMode::LastToken));
+
+    let left = pooled(&model, &left_ids, &left_mask, WIDTH);
+
+    assert_eq!(batch.len(), rows.len() * HIDDEN);
+    assert_eq!(masked.len(), batch.len());
+    for (r, row) in rows.iter().enumerate() {
+        let solo = pooled(&model, row, &vec![1; row.len()], row.len());
+        let span = r * HIDDEN..(r + 1) * HIDDEN;
+
+        let vs_solo = max_abs_diff(&solo, &batch[span.clone()]);
+        assert!(
+            vs_solo < TOLERANCE,
+            "row {r} ({} tokens) moved by {vs_solo} between the solo and the padded run",
+            row.len()
+        );
+        let vs_masked = max_abs_diff(&masked[span.clone()], &batch[span.clone()]);
+        assert!(
+            vs_masked < TOLERANCE,
+            "row {r} ({} tokens) differs by {vs_masked} from the masked forward pass",
+            row.len()
+        );
+
+        // Left padding puts padding keys in front of the real tokens, where
+        // causal attention alone does not hide them.
+        let vs_left = max_abs_diff(&solo, &left[span]);
+        if row.len() < WIDTH {
+            assert!(
+                vs_left > LEAK,
+                "row {r} ({} tokens) moved by only {vs_left} under left padding; the comparison cannot see a padding leak",
+                row.len()
+            );
+        }
+        eprintln!(
+            "GATE mask-free row={r} tokens={} vs_solo={vs_solo:.3e} vs_masked={vs_masked:.3e} vs_left={vs_left:.3e}",
+            row.len()
+        );
+    }
 }
 
 #[test]
@@ -359,7 +473,7 @@ fn qwen3_embedding_checkpoint_matches_the_model_card_similarity_matrix() {
     }
 
     // Right padding sits after the pooled position, so the padded row must
-    // reproduce the solo run. This is the property the causal mask plus
+    // reproduce the solo run. This is the property causal attention plus
     // last-token pooling buys, on the real checkpoint rather than a synthetic.
     let solo = engine
         .embed_texts(

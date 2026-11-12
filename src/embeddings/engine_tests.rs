@@ -12,9 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::engine::{EmbedOptions, EmbeddingEngine, EmbeddingEngineError};
-use super::model::ImageInput;
-use super::stub::{STUB_DIM, STUB_MAX_LENGTH, STUB_VOCAB_SIZE, stub_loaded_model};
+use std::cell::RefCell;
+use std::ops::Range;
+use std::rc::Rc;
+
+use super::engine::{
+    DEFAULT_EMBEDDING_TOKEN_BUDGET, EmbedOptions, EmbeddingEngine, EmbeddingEngineError,
+    micro_batch_bounds,
+};
+use super::model::{EmbeddingBatch, EmbeddingModel, EmbeddingOutput, ImageInput};
+use super::pooling::PoolingMode;
+use super::stub::{
+    STUB_DIM, STUB_MAX_LENGTH, STUB_VOCAB_SIZE, StubEmbeddingModel, stub_loaded_model,
+};
 
 fn engine(batch_size: usize) -> EmbeddingEngine {
     EmbeddingEngine::new(stub_loaded_model(false), batch_size)
@@ -182,6 +192,156 @@ fn multi_vector_reply_has_one_row_per_real_token() {
         )
         .unwrap();
     assert_eq!(reply.vectors[0].shape, vec![2, 3]);
+}
+
+#[test]
+fn engine_token_budget_defaults_to_4096_and_zero_turns_it_off() {
+    assert_eq!(DEFAULT_EMBEDDING_TOKEN_BUDGET, 4096);
+    assert_eq!(engine(4).token_budget(), Some(4096));
+    assert_eq!(engine(4).with_token_budget(512).token_budget(), Some(512));
+    assert_eq!(engine(4).with_token_budget(0).token_budget(), None);
+}
+
+/// The stub model, recording the `[B, L]` shape of every micro-batch it runs
+/// and reporting `pad_to` as its fixed sequence width.
+struct ShapeRecorder {
+    inner: StubEmbeddingModel,
+    pad_to: Option<usize>,
+    shapes: Rc<RefCell<Vec<Vec<i32>>>>,
+}
+
+impl EmbeddingModel for ShapeRecorder {
+    fn embed(&self, batch: &EmbeddingBatch) -> anyhow::Result<EmbeddingOutput> {
+        self.shapes
+            .borrow_mut()
+            .push(mlxcel_core::array_shape(batch.input_ids));
+        self.inner.embed(batch)
+    }
+
+    fn default_pooling(&self) -> PoolingMode {
+        self.inner.default_pooling()
+    }
+
+    fn embedding_dim(&self) -> usize {
+        self.inner.embedding_dim()
+    }
+
+    fn pad_to_max_length(&self) -> Option<usize> {
+        self.pad_to
+    }
+}
+
+/// Micro-batch shapes for four one-token rows and two six-token rows,
+/// interleaved, at `batch_size` 16 and the given budget.
+fn recorded_micro_batches(token_budget: usize) -> Vec<Vec<i32>> {
+    let shapes = Rc::new(RefCell::new(Vec::new()));
+    let mut loaded = stub_loaded_model(false);
+    loaded.model = Box::new(ShapeRecorder {
+        inner: StubEmbeddingModel::new(),
+        pad_to: None,
+        shapes: Rc::clone(&shapes),
+    });
+    let e = EmbeddingEngine::new(loaded, 16).with_token_budget(token_budget);
+    let rows = vec![vec![2; 6], vec![3], vec![4], vec![5; 6], vec![6], vec![7]];
+    let reply = e.embed_tokens(&rows, &EmbedOptions::default()).unwrap();
+    assert!((reply.vectors[0].values[2] - 1.0).abs() < 1e-6);
+    assert!((reply.vectors[3].values[5] - 1.0).abs() < 1e-6);
+    shapes.take()
+}
+
+#[test]
+fn engine_cuts_micro_batches_by_the_token_budget_it_was_given() {
+    // 5 rows x 6 tokens exceeds 12, so the long rows split off; 2 x 6 fits.
+    assert_eq!(recorded_micro_batches(12), vec![vec![4, 1], vec![2, 6]]);
+    assert_eq!(
+        recorded_micro_batches(DEFAULT_EMBEDDING_TOKEN_BUDGET),
+        vec![vec![6, 6]]
+    );
+    assert_eq!(recorded_micro_batches(0), vec![vec![6, 6]]);
+}
+
+#[test]
+fn engine_counts_a_fixed_pad_width_against_the_token_budget() {
+    let shapes = Rc::new(RefCell::new(Vec::new()));
+    let mut loaded = stub_loaded_model(false);
+    loaded.model = Box::new(ShapeRecorder {
+        inner: StubEmbeddingModel::new(),
+        pad_to: Some(8),
+        shapes: Rc::clone(&shapes),
+    });
+    let e = EmbeddingEngine::new(loaded, 16).with_token_budget(16);
+    let rows = vec![vec![3], vec![4], vec![5], vec![6]];
+    e.embed_tokens(&rows, &EmbedOptions::default()).unwrap();
+    // Every row runs 8 wide, so 2 x 8 fills the budget; counted at their raw
+    // length of 1, all four rows would fit in one micro-batch.
+    assert_eq!(shapes.take(), vec![vec![2, 8], vec![2, 8]]);
+}
+
+#[test]
+fn micro_batch_bounds_without_budget_match_fixed_row_chunks() {
+    let lengths: Vec<usize> = (1..=40).map(|n| n * 300).collect();
+    for batch_size in [1, 3, 16, 40, 64] {
+        let expected: Vec<Range<usize>> = (0..lengths.len())
+            .step_by(batch_size)
+            .map(|start| start..(start + batch_size).min(lengths.len()))
+            .collect();
+        assert_eq!(
+            micro_batch_bounds(&lengths, batch_size, None),
+            expected,
+            "batch_size {batch_size}"
+        );
+    }
+    assert!(micro_batch_bounds(&[], 16, None).is_empty());
+    assert!(micro_batch_bounds(&[], 16, Some(2048)).is_empty());
+}
+
+#[test]
+fn micro_batch_bounds_split_long_rows_by_token_budget() {
+    let lengths = [10, 10, 10, 10, 100, 100, 100, 100];
+    assert_eq!(
+        micro_batch_bounds(&lengths, 16, Some(200)),
+        vec![0..4, 4..6, 6..8]
+    );
+}
+
+#[test]
+fn micro_batch_bounds_keep_a_row_over_budget_alone() {
+    assert_eq!(
+        micro_batch_bounds(&[5, 5000, 6000], 16, Some(1000)),
+        vec![0..1, 1..2, 2..3]
+    );
+}
+
+#[test]
+fn micro_batch_bounds_still_cap_rows_at_batch_size() {
+    assert_eq!(
+        micro_batch_bounds(&[1; 10], 4, Some(1000)),
+        vec![0..4, 4..8, 8..10]
+    );
+}
+
+#[test]
+fn micro_batch_bounds_place_every_row_in_exactly_one_batch() {
+    let lengths = [1, 2, 2, 7, 30, 31, 500, 900, 2000, 8192, 8192];
+    for batch_size in [1, 2, 5, 16] {
+        for budget in [None, Some(1), Some(64), Some(2048), Some(20_000)] {
+            let bounds = micro_batch_bounds(&lengths, batch_size, budget);
+            let mut next = 0;
+            for range in &bounds {
+                assert_eq!(range.start, next, "{batch_size} {budget:?}");
+                let rows = range.len();
+                assert!((1..=batch_size).contains(&rows), "{batch_size} {budget:?}");
+                if let Some(budget) = budget {
+                    assert!(
+                        rows == 1 || rows * lengths[range.end - 1] <= budget,
+                        "{batch_size} {budget:?} {range:?}"
+                    );
+                }
+                next = range.end;
+            }
+            assert_eq!(next, lengths.len(), "{batch_size} {budget:?}");
+        }
+    }
 }
 
 #[test]

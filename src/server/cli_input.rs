@@ -157,8 +157,11 @@ pub struct ServerStartupInput {
     /// `--image-model`: resolved image-generation checkpoint directory served on
     /// `/v1/images/*` next to the chat model.
     pub image_model_path: Option<PathBuf>,
-    /// `--embedding-batch-size`: texts per embedding forward pass.
+    /// `--embedding-batch-size`: most texts per embedding forward pass.
     pub embedding_batch_size: usize,
+    /// `--embedding-token-budget`: most padded tokens per embedding forward
+    /// pass; `0` turns the budget off.
+    pub embedding_token_budget: usize,
     /// `--embedding-max-length`: token cap override for embedding inputs.
     pub embedding_max_length: Option<usize>,
     /// `--embedding-queue-depth`: bound on the embedding worker queue.
@@ -1127,6 +1130,7 @@ impl ServerStartupInput {
             embedding_model_path: self.embedding_model_path,
             image_model_path: self.image_model_path,
             embedding_batch_size: self.embedding_batch_size,
+            embedding_token_budget: self.embedding_token_budget,
             embedding_max_length: self.embedding_max_length,
             embedding_queue_depth: self.embedding_queue_depth,
             embedding_request_timeout_secs: self.embedding_request_timeout_secs,

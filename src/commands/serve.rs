@@ -817,6 +817,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         embedding_model_path,
         image_model_path,
         embedding_batch_size: args.embedding_batch_size,
+        embedding_token_budget: args.embedding_token_budget,
         embedding_max_length: args.embedding_max_length,
         embedding_queue_depth: args.embedding_queue_depth,
         embedding_request_timeout_secs: args.embedding_request_timeout_secs,

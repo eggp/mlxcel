@@ -941,6 +941,8 @@ fn embedding_and_reranking_commands_are_discoverable_in_help() {
         "--dimensions",
         "--max-length",
         "--batch-size",
+        "--embedding-token-budget",
+        "MLXCEL_EMBEDDING_TOKEN_BUDGET",
         "--models-dir",
         "--json",
     ] {
@@ -974,6 +976,56 @@ fn embedding_and_reranking_commands_are_discoverable_in_help() {
             "`mlxcel rerank --help` is missing {option}:\n{rerank_help}"
         );
     }
+}
+
+#[test]
+fn embedding_token_budget_defaults_to_4096_and_zero_parses_as_off_on_serve_and_embed() {
+    for subcommand in ["serve", "embed"] {
+        let command = Cli::command();
+        let arg = command
+            .find_subcommand(subcommand)
+            .expect("subcommand exists")
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("embedding-token-budget"))
+            .unwrap_or_else(|| panic!("`mlxcel {subcommand}` has --embedding-token-budget"));
+        assert_eq!(arg.get_default_values(), ["4096"], "mlxcel {subcommand}");
+        assert_eq!(
+            arg.get_env(),
+            Some(std::ffi::OsStr::new("MLXCEL_EMBEDDING_TOKEN_BUDGET")),
+            "mlxcel {subcommand}"
+        );
+    }
+    assert_eq!(mlxcel::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET, 4096);
+
+    let Commands::Serve(serve) = parse_cli(&[
+        "mlxcel",
+        "serve",
+        "-m",
+        "models/foo",
+        "--embedding-token-budget",
+        "0",
+    ])
+    .command
+    else {
+        panic!("expected serve command");
+    };
+    assert_eq!(serve.embedding_token_budget, 0);
+
+    let Commands::Embed(embed) = parse_cli(&[
+        "mlxcel",
+        "embed",
+        "-m",
+        "models/foo",
+        "-p",
+        "hello",
+        "--embedding-token-budget",
+        "0",
+    ])
+    .command
+    else {
+        panic!("expected embed command");
+    };
+    assert_eq!(embed.embedding_token_budget, 0);
 }
 
 /// `FAMILY_ORDER` controls the rendered section order. If a future

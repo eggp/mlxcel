@@ -84,6 +84,7 @@ fn sample_input() -> ServerStartupInput {
         embedding_model_path: None,
         image_model_path: None,
         embedding_batch_size: 16,
+        embedding_token_budget: 4096,
         embedding_max_length: None,
         embedding_queue_depth: 8,
         embedding_request_timeout_secs: 120,
@@ -453,6 +454,16 @@ fn into_startup_config_propagates_image_limits() {
     assert_eq!(startup.max_image_width, 4096);
     assert_eq!(startup.max_image_height, 2048);
     assert_eq!(startup.max_image_decode_alloc_bytes, 64 * 1024 * 1024);
+}
+
+#[test]
+fn into_startup_config_propagates_embedding_token_budget() {
+    for budget in [0, 1024] {
+        let mut input = sample_input();
+        input.embedding_token_budget = budget;
+        let startup = input.into_startup_config().expect("valid startup input");
+        assert_eq!(startup.embedding_token_budget, budget);
+    }
 }
 
 #[test]

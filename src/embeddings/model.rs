@@ -40,9 +40,11 @@ pub struct ImageInput {
 /// One right-padded micro-batch presented to [`EmbeddingModel::embed`].
 ///
 /// All arrays are `[B, L]` int32. `attention_mask` is `1` for a real token
-/// and `0` for padding; the family builds its attention mask from it with
+/// and `0` for padding. Pooling reads it, and a family whose attention must
+/// hide padding keys builds its mask from it with
 /// `mlxcel_core::utils::create_bidirectional_padding_mask` or
-/// `create_causal_padding_mask`.
+/// `create_causal_padding_mask`. Qwen3-Embedding builds no mask: under its
+/// causal attention no real token sees the padding that follows it.
 pub struct EmbeddingBatch<'a> {
     /// `[B, L]` int32, right-padded with the checkpoint's pad token id.
     pub input_ids: &'a MlxArray,

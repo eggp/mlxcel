@@ -47,6 +47,7 @@ fn embedding_provider() -> Arc<dyn EmbeddingModelProvider> {
         EmbeddingWorkerProvider::from_loader(
             EMBEDDING_ID.to_string(),
             4,
+            crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
             8,
             Duration::from_secs(30),
             || Ok(crate::embeddings::stub::stub_loaded_model(false)),
