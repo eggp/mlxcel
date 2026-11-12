@@ -16,9 +16,14 @@
 //!
 //! Four properties carry this path: the prompt is byte-identical to the
 //! reference recipe, truncation never eats the assistant header the score is
-//! read from, left padding puts every row's last real token at column
-//! `L - 1`, and the score is the sigmoid of the yes/no logit difference at
+//! read from, left padding puts the last real token of every row forwarded
+//! whole at column `L - 1`, and the score is the sigmoid of the yes/no logit difference at
 //! that column.
+//!
+//! A request of several documents scores from a shared run instead: the tokens
+//! all rows open with are forwarded once and each micro-batch forwards only the
+//! rows' tails. The gates for it hold its scores to the whole-row scores and
+//! count the token positions the backbone computed.
 //!
 //! Everything runs on a synthetic 2-layer backbone and a word-level
 //! tokenizer, so no checkpoint is needed; the real-checkpoint gate lives in
@@ -172,12 +177,43 @@ fn qwen_like_tokenizer_json(extra_added: Option<&str>) -> String {
 /// Build a reranker over the synthetic backbone.
 fn build(max_length: usize, batch_size: usize) -> Qwen3Reranker {
     let args = tiny_args();
-    let weights = tiny_weights(&args);
-    let model = crate::models::qwen3::Qwen3Model::from_weights(&weights, &args)
+    build_from(&tiny_weights(&args), &args, max_length, batch_size)
+}
+
+/// Weight scale of [`build_position_sensitive`].
+const POSITION_SENSITIVE_GAIN: f32 = 8.0;
+
+/// Build a reranker whose scores depend on where each token sits.
+///
+/// Every weight scaled by [`POSITION_SENSITIVE_GAIN`] makes the score move
+/// enough with token positions to tell a misplaced tail from f32 rounding:
+/// measured on this backbone, the documents of
+/// [`documents_of_unsorted_lengths`] score from 0.53 to 0.75, and tails one
+/// position off move the request's scores by 3.1e-3.
+fn build_position_sensitive(max_length: usize, batch_size: usize) -> Qwen3Reranker {
+    let args = tiny_args();
+    let weights: WeightMap = tiny_weights(&args)
+        .iter()
+        .map(|(name, array)| {
+            let scaled = mlxcel_core::multiply_scalar(array, POSITION_SENSITIVE_GAIN);
+            (name.clone(), scaled)
+        })
+        .collect();
+    build_from(&weights, &args, max_length, batch_size)
+}
+
+/// Assemble a reranker from synthetic weights and the test tokenizer.
+fn build_from(
+    weights: &WeightMap,
+    args: &ModelArgs,
+    max_length: usize,
+    batch_size: usize,
+) -> Qwen3Reranker {
+    let model = crate::models::qwen3::Qwen3Model::from_weights(weights, args)
         .expect("synthetic Qwen3 loads");
     Qwen3Reranker::from_parts(
         model,
-        &args,
+        args,
         qwen_like_tokenizer(None),
         /* pad_token_id */ 0,
         max_length,
@@ -371,9 +407,9 @@ fn sigmoid_of_logit_difference() {
     let logits = to_vec(&reranker.model.embed_tokens.as_linear(&last));
     let expected = 1.0 / (1.0 + (-(logits[YES_ID as usize] - logits[NO_ID as usize])).exp());
 
-    // The batched call left-pads the shorter row, which shifts its RoPE
-    // positions, so only the row that is already the longest is comparable
-    // element for element. Score it alone to make the comparison exact.
+    // The two-document call scores from a shared run computed apart from the
+    // rows' tails, which rounds differently from one prefill. Score the
+    // document alone to make the comparison exact.
     let alone = reranker
         .score(
             &RerankItem::text("what is panda?"),
@@ -415,6 +451,10 @@ fn score_until_stops_between_micro_batches_when_abandoned() {
         RerankItem::text("capital beijing"),
         RerankItem::text("panda china"),
     ];
+    assert!(
+        shared_run_len(&encoded_rows(&reranker, "what is panda?", &documents)) > 0,
+        "the request must be one that scores from a shared run"
+    );
     let checks = std::cell::Cell::new(0usize);
     let err = reranker
         .score_until(
@@ -556,6 +596,259 @@ fn prompt_tokens_count_every_row_once_whatever_the_batching_order() {
         .score(&RerankItem::text("what is panda?"), &documents, None)
         .expect("scoring succeeds");
     assert_eq!(scored.prompt_tokens, expected);
+}
+
+/// The prompt row each document encodes to.
+fn encoded_rows(
+    reranker: &Qwen3Reranker,
+    query: &str,
+    documents: &[RerankItem],
+) -> Vec<EncodedRow> {
+    documents
+        .iter()
+        .map(|document| EncodedRow {
+            ids: reranker
+                .encode_row(DEFAULT_INSTRUCTION, query, document.text_or_empty())
+                .expect("row encodes"),
+            type_ids: None,
+        })
+        .collect()
+}
+
+fn row_of(ids: &[u32]) -> EncodedRow {
+    EncodedRow {
+        ids: ids.to_vec(),
+        type_ids: None,
+    }
+}
+
+/// Largest score difference allowed between the shared-run path and whole
+/// rows on [`build_position_sensitive`].
+///
+/// Both paths compute the same function of the same tokens: a tail sits at
+/// the positions it has in a single full row and sees the same keys. What
+/// differs is f32 rounding: the run's keys and values are computed at batch 1
+/// and read back from a cache, and a left-padded whole row is rotated at
+/// shifted absolute positions. Measured on this backbone, the shared-run
+/// scores differ from whole rows by 9.5e-7, and whole rows in a padded batch
+/// differ from the same rows scored alone by 4.2e-7. The bound is ten times
+/// the first figure and about three hundred times below the 3.1e-3 that
+/// tails one position off cost.
+const SHARED_RUN_TOLERANCE: f32 = 1e-5;
+
+#[test]
+fn shared_run_is_the_common_prefix_and_leaves_every_row_a_tail() {
+    assert_eq!(
+        shared_run_len(&[
+            row_of(&[1, 2, 3, 4, 5, 6]),
+            row_of(&[1, 2, 3, 4, 9, 9, 9]),
+            row_of(&[1, 2, 3, 7, 7, 7]),
+        ]),
+        3,
+        "the run ends where the first row departs"
+    );
+    assert_eq!(
+        shared_run_len(&[row_of(&[1, 2, 3, 4, 5]), row_of(&[1, 2, 3, 4, 5, 6, 7])]),
+        3,
+        "a row that is a prefix of another keeps two tokens of its own"
+    );
+    assert_eq!(
+        shared_run_len(&[row_of(&[1, 2, 3, 4, 5]), row_of(&[1, 2, 3, 4, 5])]),
+        3,
+        "identical rows keep two tokens each"
+    );
+    assert_eq!(
+        shared_run_len(&[row_of(&[1, 2, 3, 4, 5])]),
+        0,
+        "one row shares nothing"
+    );
+    assert_eq!(shared_run_len(&[]), 0);
+    assert_eq!(shared_run_len(&[row_of(&[1, 2, 3]), row_of(&[4, 5, 6])]), 0);
+    assert_eq!(
+        shared_run_len(&[row_of(&[1, 2, 3, 4]), row_of(&[1, 5, 6, 7])]),
+        0,
+        "a one-token run is not forwarded on its own"
+    );
+    assert_eq!(
+        shared_run_len(&[row_of(&[1, 2, 3]), row_of(&[1, 2, 3, 4])]),
+        0,
+        "the shortest row leaves a run of one token"
+    );
+}
+
+#[test]
+fn shared_run_scores_match_whole_rows_and_forward_the_run_once() {
+    let _guard = mlx_test_guard();
+    let batch_size = 2;
+    let reranker = build_position_sensitive(256, batch_size);
+    let documents = documents_of_unsorted_lengths();
+    let rows = encoded_rows(&reranker, "what is panda?", &documents);
+    let lengths: Vec<usize> = rows.iter().map(|row| row.ids.len()).collect();
+    let order = batching_order(&lengths);
+
+    let shared = shared_run_len(&rows);
+    assert!(
+        shared > reranker.prefix_ids.len(),
+        "the run must reach past the fixed prefix into the instruction and the query, got \
+         {shared} of a {}-token prefix",
+        reranker.prefix_ids.len()
+    );
+    assert!(
+        order
+            .chunks(batch_size)
+            .any(|chunk| chunk.len() == 2 && lengths[chunk[0]] != lengths[chunk[1]]),
+        "a micro-batch must hold tails of different lengths, row lengths {lengths:?}"
+    );
+
+    let (whole, whole_forwarded) = reranker
+        .score_encoded(&rows, 0, &|| false)
+        .expect("whole rows score");
+    let (tails, tails_forwarded) = reranker
+        .score_encoded(&rows, shared, &|| false)
+        .expect("tails score");
+
+    for (i, a) in whole.scores.iter().enumerate() {
+        for (j, b) in whole.scores.iter().enumerate().skip(i + 1) {
+            assert!(
+                (a - b).abs() > 100.0 * SHARED_RUN_TOLERANCE,
+                "documents {i} and {j} must score apart for a wrong read to show: {:?}",
+                whole.scores
+            );
+        }
+    }
+    assert!(
+        max_abs_diff(&tails.scores, &whole.scores) < SHARED_RUN_TOLERANCE,
+        "scores from the shared run {:?} differ from whole rows {:?} by {}",
+        tails.scores,
+        whole.scores,
+        max_abs_diff(&tails.scores, &whole.scores)
+    );
+    // Every tail one position further from the run than it belongs, as an
+    // off-by-one cache offset would put it, must move the request's scores by
+    // more than the tolerance, or the comparison above could not see it.
+    let score_tails_at = |gap: usize| -> Vec<f32> {
+        rows.iter()
+            .map(|row| score_with_gap(&reranker, &row.ids, shared, gap))
+            .collect()
+    };
+    let (in_place, one_off) = (score_tails_at(0), score_tails_at(1));
+    assert!(
+        max_abs_diff(&one_off, &in_place) > 10.0 * SHARED_RUN_TOLERANCE,
+        "tails one position off score {one_off:?}, too close to {in_place:?} for the \
+         tolerance to catch"
+    );
+
+    assert_eq!(whole.prompt_tokens, lengths.iter().sum::<usize>());
+    assert_eq!(
+        tails.prompt_tokens, whole.prompt_tokens,
+        "prompt_tokens counts every token of every full row on both paths"
+    );
+
+    assert_eq!(
+        whole_forwarded,
+        computed_positions(&lengths, &order, batch_size),
+        "whole rows forward every padded row"
+    );
+    let tail_lengths: Vec<usize> = lengths.iter().map(|length| length - shared).collect();
+    assert_eq!(
+        tails_forwarded,
+        shared + computed_positions(&tail_lengths, &order, batch_size),
+        "the run is forwarded once for the request, then only the padded tails"
+    );
+
+    // The public entry takes the shared-run path. The two paths differ only
+    // by f32 rounding, so only the exact scores tell them apart: the same
+    // computation repeated gives the same bits.
+    let scored = reranker
+        .score(&RerankItem::text("what is panda?"), &documents, None)
+        .expect("scoring succeeds");
+    assert_ne!(
+        tails.scores, whole.scores,
+        "the two paths must round apart for the public entry's path to show"
+    );
+    assert_eq!(
+        scored.scores, tails.scores,
+        "the public entry must score from the shared run"
+    );
+    assert_eq!(scored.prompt_tokens, tails.prompt_tokens);
+}
+
+/// The score of `row` forwarded whole and alone, with `gap` masked pad
+/// columns inserted before token `at`: every token from `at` on then sits
+/// `gap` positions further from the ones before it than in the row itself.
+fn score_with_gap(reranker: &Qwen3Reranker, row: &[u32], at: usize, gap: usize) -> f32 {
+    let pad = reranker.pad_token_id as i32;
+    let mut ids: Vec<i32> = row[..at].iter().map(|&id| id as i32).collect();
+    ids.extend(std::iter::repeat_n(pad, gap));
+    ids.extend(row[at..].iter().map(|&id| id as i32));
+    let mut real = vec![1; at];
+    real.extend(std::iter::repeat_n(0, gap));
+    real.extend(std::iter::repeat_n(1, row.len() - at));
+    let width = ids.len() as i32;
+    let mask = mlxcel_core::utils::create_causal_padding_mask(&ids_array(&real, 1, width), 0);
+    let mut caches = reranker.model.make_caches();
+    let hidden =
+        reranker
+            .model
+            .forward_hidden(&ids_array(&ids, 1, width), None, &mut caches, Some(&mask));
+    reranker
+        .yes_probabilities(&slice_axis(&hidden, 1, width - 1, width))
+        .expect("the row scores")[0]
+}
+
+#[test]
+fn identical_documents_score_alike_from_a_two_token_tail() {
+    let _guard = mlx_test_guard();
+    let reranker = build_position_sensitive(128, 2);
+    let documents = vec![RerankItem::text("panda bear china"); 3];
+    let rows = encoded_rows(&reranker, "what is panda?", &documents);
+    let length = rows[0].ids.len();
+    let shared = shared_run_len(&rows);
+    assert_eq!(
+        shared,
+        length - 2,
+        "identical rows share all but two tokens"
+    );
+
+    let (whole, _) = reranker
+        .score_encoded(&rows[..1], 0, &|| false)
+        .expect("one whole row scores");
+    let (tails, forwarded) = reranker
+        .score_encoded(&rows, shared, &|| false)
+        .expect("tails score");
+    assert_eq!(
+        forwarded,
+        shared + 2 * 2 + 2,
+        "the run, then two tails and one"
+    );
+    assert_eq!(tails.prompt_tokens, 3 * length);
+    for score in &tails.scores {
+        assert!(
+            (score - whole.scores[0]).abs() < SHARED_RUN_TOLERANCE,
+            "scores {:?} differ from the document scored whole, {}",
+            tails.scores,
+            whole.scores[0]
+        );
+    }
+}
+
+#[test]
+fn single_document_request_forwards_its_whole_row() {
+    let _guard = mlx_test_guard();
+    let reranker = build(128, 4);
+    let documents = [RerankItem::text("panda bear china")];
+    let rows = encoded_rows(&reranker, "what is panda?", &documents);
+    assert_eq!(shared_run_len(&rows), 0);
+
+    let (scored, forwarded) = reranker
+        .score_encoded(&rows, shared_run_len(&rows), &|| false)
+        .expect("a single document scores");
+    assert_eq!(forwarded, rows[0].ids.len());
+    assert_eq!(scored.prompt_tokens, rows[0].ids.len());
+    let through_trait = reranker
+        .score(&RerankItem::text("what is panda?"), &documents, None)
+        .expect("scoring succeeds");
+    assert!(max_abs_diff(&through_trait.scores, &scored.scores) < 1e-6);
 }
 
 const CHECKPOINT_SEED: u64 = 0x1356_0BAD_F00D;

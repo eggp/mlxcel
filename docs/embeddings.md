@@ -58,7 +58,7 @@ Relevance scoring lives on the same page, under [Reranking](#reranking-v1rerank-
 | `src/rerank/mod.rs` | `Reranker` trait, `RerankerKind`, `RerankItem`, `detect_reranker_kind`. |
 | `src/rerank/loader.rs` | `load_reranker`: kind dispatch, batch-size and length overrides. |
 | `src/rerank/sequence_classifier.rs` | Cross-encoder path: pair tokenization, longest-first truncation, `sigmoid(logit)`. |
-| `src/rerank/qwen3_generative.rs` | Qwen3 yes/no path: the prompt recipe, left padding, `sigmoid(logit(yes) - logit(no))`. |
+| `src/rerank/qwen3_generative.rs` | Qwen3 yes/no path: the prompt recipe, the shared run a request's rows open with, left padding for whole rows, `sigmoid(logit(yes) - logit(no))`. |
 | `src/rerank/qwen3_vl_generative.rs` | Qwen3-VL yes/no path: `reranker.jinja`, image merge, `1_LogitScore` token ids. |
 | `src/server/rerank_model.rs` | `RerankModelProvider` trait and `RerankError`. |
 | `src/server/rerank_worker.rs` | `RerankWorker`: the dedicated MLX-owning thread, bounded queue, timeout, panic boundary. |
@@ -509,9 +509,11 @@ SUFFIX  = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
 Default `instruction`: `Given a web search query, retrieve relevant passages that answer the query`. The three pieces are tokenized separately and concatenated, so only `CONTENT` is truncated; the prefix and the assistant header the score is read from always survive. `yes` and `no` are resolved at load by encoding them without special tokens (9693 and 2152 on the Qwen3 tokenizer) and the load fails if either is not a single token.
 
-Rows are **left**-padded with the checkpoint's pad token, which is what puts every row's last real token at column `L - 1`, and the mask is `create_causal_padding_mask`, so the pad prefix is blocked as a key everywhere. Absolute positions still run `0..L` over the padded row, exactly as the reference `Qwen3ForCausalLM.forward(input_ids, attention_mask)` does when it derives `position_ids` from the cache position. One consequence worth knowing: a document's score depends slightly on the batch it was scored in, because a left-padded row's real tokens sit at shifted positions. That is a property of the reference recipe, not of this port.
+Every row of a request opens with the same tokens: the prefix, the instruction and the query. A request of two or more documents forwards the longest token run all its rows open with once, as a single row, and keeps each layer's keys and values. The run ends at least two tokens before the end of the shortest row, so every row keeps a tail of its own. Each micro-batch then forwards only its rows' tails against a cache that starts as that run, so every tail token sits at the position it has in its full row. Tail batches are **right**-padded, the causal mask hides the trailing padding from every real token, and each score is read at the row's own last real token. One consequence worth knowing: a document's score can differ slightly from the same document scored alone, by numerical rounding that depends on the shape of the micro-batch and on the run being computed once, at batch size 1.
 
-A request's rows are sorted by token length, longest first and equal lengths in arrival order, cut into micro-batches of `--rerank-batch-size`, and the scores are written back in request order. Which rows share a micro-batch therefore depends on the lengths of the request's documents, not on the order they were sent in.
+A request with one document has nothing to share and forwards its full row. Rows forwarded whole are **left**-padded with the checkpoint's pad token, which is what puts every row's last real token at column `L - 1`, and the mask is `create_causal_padding_mask`, so the pad prefix is blocked as a key everywhere. Absolute positions still run `0..L` over the padded row, exactly as the reference `Qwen3ForCausalLM.forward(input_ids, attention_mask)` does when it derives `position_ids` from the cache position.
+
+A request's rows are sorted by token length, longest first and equal lengths in arrival order, cut into micro-batches of `--rerank-batch-size`, and the scores are written back in request order. Which rows share a micro-batch therefore depends on the lengths of the request's documents, not on the order they were sent in. `prompt_tokens` counts every token of every full row, so the shared run counts once for each document.
 
 ### Qwen3-VL generative scoring
 
