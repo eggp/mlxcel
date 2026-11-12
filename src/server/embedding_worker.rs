@@ -63,6 +63,8 @@ pub(crate) struct EmbeddingWorkerInfo {
     pub multi_vector: bool,
     pub supports_images: bool,
     pub batch_size: usize,
+    /// Padded-token budget per micro-batch; `None` when it is off.
+    pub token_budget: Option<usize>,
     pub model_type: ModelType,
     /// The pooling this checkpoint resolved, reported by `/props` (#1452).
     pub pooling: crate::embeddings::PoolingMode,
@@ -114,13 +116,14 @@ impl EmbeddingWorker {
     /// `loader` runs on the worker thread so every array it creates belongs
     /// to that thread's MLX context. `queue_depth` bounds the command
     /// channel (clamped to at least one), `request_timeout` bounds the reply
-    /// wait (a zero falls back to the default), and `batch_size` is the
-    /// micro-batch width handed to the engine.
+    /// wait (a zero falls back to the default), and `batch_size` and
+    /// `token_budget` bound the micro-batches the engine cuts.
     pub(crate) fn spawn<L>(
         thread_name: &str,
         queue_depth: usize,
         request_timeout: Duration,
         batch_size: usize,
+        token_budget: usize,
         loader: L,
     ) -> anyhow::Result<Self>
     where
@@ -131,6 +134,7 @@ impl EmbeddingWorker {
             queue_depth,
             request_timeout,
             batch_size,
+            token_budget,
             mlxcel_core::clear_memory_cache,
             loader,
         )
@@ -143,6 +147,7 @@ impl EmbeddingWorker {
         queue_depth: usize,
         request_timeout: Duration,
         batch_size: usize,
+        token_budget: usize,
         clear_cache: C,
         loader: L,
     ) -> anyhow::Result<Self>
@@ -161,7 +166,16 @@ impl EmbeddingWorker {
 
         let handle = thread::Builder::new()
             .name(thread_name.to_string())
-            .spawn(move || worker_loop(loader, batch_size, clear_cache, command_rx, ready_tx))
+            .spawn(move || {
+                worker_loop(
+                    loader,
+                    batch_size,
+                    token_budget,
+                    clear_cache,
+                    command_rx,
+                    ready_tx,
+                )
+            })
             .map_err(|e| anyhow::anyhow!("failed to spawn embedding worker thread: {e}"))?;
 
         match ready_rx.recv() {
@@ -295,6 +309,7 @@ impl Drop for EmbeddingWorker {
 fn worker_loop<L, C>(
     loader: L,
     batch_size: usize,
+    token_budget: usize,
     clear_cache: C,
     commands: mpsc::Receiver<EmbeddingCommand>,
     ready: mpsc::Sender<Result<EmbeddingWorkerInfo, String>>,
@@ -306,7 +321,7 @@ fn worker_loop<L, C>(
     install_thread_local_default_stream(stream.as_ref());
 
     let engine = match loader() {
-        Ok(loaded) => EmbeddingEngine::new(loaded, batch_size),
+        Ok(loaded) => EmbeddingEngine::new(loaded, batch_size).with_token_budget(token_budget),
         Err(err) => {
             let _ = ready.send(Err(format!("{err:#}")));
             return;
@@ -319,6 +334,7 @@ fn worker_loop<L, C>(
         multi_vector: engine.multi_vector(),
         supports_images: engine.supports_images(),
         batch_size: engine.batch_size(),
+        token_budget: engine.token_budget(),
         model_type: engine.model_type(),
         pooling: engine.pooling(),
         embd_normalize: engine.default_normalize(),
@@ -434,6 +450,7 @@ impl EmbeddingWorkerProvider {
         model_path: &Path,
         model_id: String,
         batch_size: usize,
+        token_budget: usize,
         queue_depth: usize,
         request_timeout: Duration,
         load_options: EmbeddingLoadOptions,
@@ -442,6 +459,7 @@ impl EmbeddingWorkerProvider {
         Self::from_loader(
             model_id,
             batch_size,
+            token_budget,
             queue_depth,
             request_timeout,
             move || load_embedding_model_with_options(&model_path, load_options),
@@ -453,6 +471,7 @@ impl EmbeddingWorkerProvider {
     pub(crate) fn from_loader<L>(
         model_id: String,
         batch_size: usize,
+        token_budget: usize,
         queue_depth: usize,
         request_timeout: Duration,
         loader: L,
@@ -465,6 +484,7 @@ impl EmbeddingWorkerProvider {
             queue_depth,
             request_timeout,
             batch_size,
+            token_budget,
             loader,
         )?;
         let created_at = std::time::SystemTime::now()

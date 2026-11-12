@@ -470,7 +470,7 @@ pub const DEFAULT_AUDIO_QUEUE_DEPTH: usize = 8;
 /// thread after this instead of hanging.
 pub const DEFAULT_AUDIO_REQUEST_TIMEOUT_SECS: u64 = 120;
 
-/// Default `--embedding-batch-size`: texts per embedding forward pass.
+/// Default `--embedding-batch-size`: most texts per embedding forward pass.
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = crate::embeddings::DEFAULT_EMBEDDING_BATCH_SIZE;
 
 /// Default bound for the embedding worker command queue; tracks the audio
@@ -877,7 +877,7 @@ pub struct ServerConfig {
     /// next to the chat model. `None` means "use `-m` when it is itself an
     /// embedding checkpoint, otherwise serve no embeddings".
     pub embedding_model_path: Option<std::path::PathBuf>,
-    /// `--embedding-batch-size`: texts per embedding forward pass. See
+    /// `--embedding-batch-size`: most texts per embedding forward pass. See
     /// [`DEFAULT_EMBEDDING_BATCH_SIZE`].
     pub embedding_batch_size: usize,
     /// `--embedding-max-length`: ceiling for the token cap derived from the

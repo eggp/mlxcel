@@ -595,7 +595,9 @@ fn embeddinggemma_long_document_past_the_sliding_window_is_batch_invariant() {
     };
     let _runtime = crate::initialize_runtime();
     let loaded = crate::embeddings::load_embedding_model(&dir).expect("EmbeddingGemma loads");
-    let engine = crate::embeddings::EmbeddingEngine::new(loaded, 4);
+    // The budget off keeps the long and the short text in one micro-batch
+    // whatever the long text's length.
+    let engine = crate::embeddings::EmbeddingEngine::new(loaded, 4).with_token_budget(0);
 
     // Well past the 512-token sliding window, so the windowed mask and the
     // full mask genuinely disagree on this input.

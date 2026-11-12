@@ -421,7 +421,7 @@ A mask is never built as `(1 - m) * C` with a finite `C` in the activation dtype
 - Token-id inputs are used verbatim (no special tokens added) and every id must be `< vocab_size`.
 - `encoding_format: base64` encodes each vector as little-endian f32 bytes, standard base64 with padding. For multi-vector (late-interaction) models `embedding` is a list of vectors, `[num_real_tokens][D]`, in float mode; in base64 mode it is the row-major bytes plus a sibling `"shape": [num_real_tokens, D]`.
 - `usage.prompt_tokens` counts the real (non-padding) tokens across all inputs, special tokens included; `total_tokens` equals it.
-- `image_url` items accept a `data:image/...;base64,` URI, a `file://` path, an `http(s)://` URL or a local path, bounded by the shared image limits. Images are embedded one at a time; text items are sorted by token length, cut into micro-batches of `--embedding-batch-size`, and written back in request order.
+- `image_url` items accept a `data:image/...;base64,` URI, a `file://` path, an `http(s)://` URL or a local path, bounded by the shared image limits. Images are embedded one at a time; text items are sorted by token length, cut into micro-batches of at most `--embedding-batch-size` texts and at most `--embedding-token-budget` padded tokens (texts times the padded length of the longest one), and written back in request order. A text longer than the budget runs alone. A text's vector can differ slightly depending on which texts share its micro-batch.
 
 ### Errors
 
@@ -439,7 +439,8 @@ A mask is never built as `(1 - m) * C` with a finite `C` in the activation dtype
 |------|-----|---------|---------|
 | `-m <embedding checkpoint>` | `LLAMA_ARG_MODEL` | | Serves the checkpoint on `/v1/embeddings`; on the MLX path the chat provider starts without a chat model, so no generation load is attempted. |
 | `--embedding-model <path or repo-id>` | `LLAMA_ARG_EMBEDDING_MODEL`, `MLXCEL_EMBEDDING_MODEL` | unset | A second checkpoint served on `/v1/embeddings` next to the chat model in `-m`. Resolved and auto-downloaded like `-m`. Combining it with an embedding checkpoint in `-m` is a startup error ("two embedding models"). A load failure of an explicit `--embedding-model` is a startup error; a load failure of an `-m` embedding checkpoint is logged and the route answers `501`. |
-| `--embedding-batch-size N` | `MLXCEL_EMBEDDING_BATCH_SIZE` | `16` | Texts per forward pass. |
+| `--embedding-batch-size N` | `MLXCEL_EMBEDDING_BATCH_SIZE` | `16` | Most texts per forward pass; `--embedding-token-budget` can close a micro-batch earlier. |
+| `--embedding-token-budget N` | `MLXCEL_EMBEDDING_TOKEN_BUDGET` | `4096` | Most padded tokens per forward pass: a micro-batch closes before its text count times the padded length of its longest text would exceed this, so a few long texts do not pad many short ones. A text longer than the budget runs alone. `0` turns the budget off and cuts by `--embedding-batch-size` only. |
 | `--embedding-max-length N` | `MLXCEL_EMBEDDING_MAX_LENGTH` | derived (ceiling `8192`) | Upper bound on the derived `max_length`. A positive value replaces the `8192` ceiling. A larger override is still bounded by the checkpoint's `sentence_bert_config.json`, `processor_config.json` and `tokenizer_config.json` limits, and by `config.json` `max_position_embeddings` on absolute-position families; rotary-position families do not consult `max_position_embeddings`, so keep the value within it. A lower value lowers the result, and unset or `0` keeps `8192`. A larger limit costs memory in proportion to the longest input. |
 | `--embedding-queue-depth N` | `MLXCEL_EMBEDDING_QUEUE_DEPTH` | `8` | Bound on each embedding/reranking worker command queue; a full queue returns `503`. |
 | `--embedding-request-timeout-secs N` | `MLXCEL_EMBEDDING_REQUEST_TIMEOUT_SECS` | `120` | Per-request embedding/reranking reply timeout; `0` falls back to the default. |
@@ -472,7 +473,7 @@ On the MLX path, an embedding checkpoint in `-m` is detected before the chat pro
 ```text
 mlxcel embed -m <path or repo-id> -p "text" [-p "text2" ...] [--image <file> ...]
              [--instruction "..."] [--dimensions N] [--max-length N] [--batch-size N]
-             [--models-dir PATH] [--json]
+             [--embedding-token-budget N] [--models-dir PATH] [--json]
 ```
 
 Prints one vector per input (`[v1, v2, ...]`, one line each; a list of rows for multi-vector models) and, with two or more inputs, the similarity matrix: cosine for single-vector models, MaxSim for multi-vector ones (the header names which one). `--json` prints one object with `embeddings`, `shapes`, `prompt_tokens` and `similarity` instead. This is the offline validation tool for every family: the same loader, pooling, normalization and batching as the server, without a listener.

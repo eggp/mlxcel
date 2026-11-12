@@ -28,6 +28,7 @@ fn provider() -> EmbeddingWorkerProvider {
     EmbeddingWorkerProvider::from_loader(
         "stub-embed".to_string(),
         4,
+        64,
         8,
         Duration::from_secs(30),
         || Ok(stub_loaded_model(false)),
@@ -45,7 +46,22 @@ fn worker_loads_stub_and_reports_info() {
     assert!(!p.multi_vector());
     assert!(!p.supports_images());
     assert_eq!(p.info().batch_size, 4);
+    assert_eq!(p.info().token_budget, Some(64));
     assert!(p.created_at() > 0);
+}
+
+#[test]
+fn worker_turns_the_token_budget_off_at_zero() {
+    let p = EmbeddingWorkerProvider::from_loader(
+        "stub-embed".to_string(),
+        4,
+        0,
+        8,
+        Duration::from_secs(30),
+        || Ok(stub_loaded_model(false)),
+    )
+    .expect("stub worker spawns");
+    assert_eq!(p.info().token_budget, None);
 }
 
 #[test]
@@ -93,6 +109,7 @@ fn worker_surfaces_loader_failure() {
     let result = EmbeddingWorkerProvider::from_loader(
         "broken".to_string(),
         4,
+        4096,
         8,
         Duration::from_secs(30),
         || Err(anyhow::anyhow!("synthetic load failure")),
@@ -138,6 +155,7 @@ fn worker_survives_a_panicking_request_and_keeps_serving() {
     let p = EmbeddingWorkerProvider::from_loader(
         "panicky".to_string(),
         4,
+        4096,
         8,
         Duration::from_secs(30),
         || Ok(panicking_loaded_model()),
@@ -184,6 +202,7 @@ fn request_timeout_returns_timeout_error() {
     let p = EmbeddingWorkerProvider::from_loader(
         "slow".to_string(),
         4,
+        4096,
         8,
         Duration::from_millis(50),
         || {
@@ -233,6 +252,7 @@ fn queue_full_returns_queuefull_error() {
         queue_depth,
         Duration::from_millis(150),
         4,
+        4096,
         move || {
             let mut loaded = stub_loaded_model(false);
             loaded.model = Box::new(BlockingModel {
@@ -278,6 +298,7 @@ where
         8,
         Duration::from_secs(30),
         4,
+        4096,
         move || {
             counter.fetch_add(1, Ordering::SeqCst);
         },
@@ -411,6 +432,7 @@ fn each_request_kind_releases_the_cache_once_before_its_reply() {
         8,
         Duration::from_secs(30),
         4,
+        4096,
         move || {
             let _ = entered_tx.send(());
             let _ = gate_rx.recv();

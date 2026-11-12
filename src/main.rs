@@ -1874,12 +1874,22 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "MLXCEL_IMAGE_MODEL", value_name = "PATH_OR_REPO_ID")]
     image_model: Option<String>,
 
-    /// Texts per embedding forward pass (default: 16)
+    /// Most texts per embedding forward pass (default: 16)
     ///
     /// `/v1/embeddings` sorts text inputs by token length and cuts them into
-    /// micro-batches of this size, each right-padded to its longest member.
+    /// micro-batches of at most this many texts and at most
+    /// `--embedding-token-budget` padded tokens, each right-padded to its
+    /// longest member.
     #[arg(long, env = "MLXCEL_EMBEDDING_BATCH_SIZE", default_value_t = 16)]
     embedding_batch_size: usize,
+
+    /// Padded tokens per embedding forward pass; 0 turns the budget off (default: 4096)
+    ///
+    /// A micro-batch closes before its text count times the padded length of
+    /// its longest member would exceed this budget, so a few long texts do not
+    /// pad many short ones; a text longer than the budget runs alone.
+    #[arg(long, env = "MLXCEL_EMBEDDING_TOKEN_BUDGET", default_value_t = 4096)]
+    embedding_token_budget: usize,
 
     /// Token cap per embedding input (default: derived from the checkpoint)
     ///

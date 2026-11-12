@@ -111,6 +111,7 @@ fn stub_provider(multi_vector: bool, batch_size: usize) -> Arc<dyn EmbeddingMode
         EmbeddingWorkerProvider::from_loader(
             STUB_MODEL_ID.to_string(),
             batch_size,
+            crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
             8,
             Duration::from_secs(30),
             move || Ok(stub_loaded_model(multi_vector)),
