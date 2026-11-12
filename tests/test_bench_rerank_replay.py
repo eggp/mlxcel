@@ -359,8 +359,9 @@ class ToolTestCase(unittest.TestCase):
         second busy reading, not its first: while the request is in flight
         only the sampler thread reads, and it folds one reading into the open
         windows before it takes the next, so the first busy reading is
-        already folded when the request is released, however slow the
-        threads run."""
+        already folded when the request is released. This holds while the
+        second busy reading comes within the stub's 10 second hold; past it
+        the stub releases the request unseen."""
         busy_readings = {}
 
         def read_footprint(pid):
