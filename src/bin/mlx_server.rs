@@ -793,7 +793,7 @@ struct ServerArgs {
     )]
     image_model: Option<String>,
 
-    /// Texts per embedding forward pass (default: 16)
+    /// Most texts per embedding forward pass (default: 16)
     ///
     /// `/v1/embeddings` sorts text inputs by token length and cuts them into
     /// micro-batches of at most this many texts and at most
@@ -3743,6 +3743,26 @@ mod tests {
         let _env = ScopedEnv::set(&[("MLXCEL_EMBEDDING_TOKEN_BUDGET", "2048")]);
         let args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
         assert_eq!(args.embedding_token_budget, 2048);
+    }
+
+    #[test]
+    fn build_startup_input_propagates_embedding_token_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local_model = tmp.path().join("local-model");
+        fs::create_dir_all(&local_model).unwrap();
+        let local_model_arg = local_model.to_string_lossy().to_string();
+
+        for budget in ["1234", "0"] {
+            let input = build_startup_input(parse_server_args(&[
+                "mlxcel-server",
+                "-m",
+                &local_model_arg,
+                "--embedding-token-budget",
+                budget,
+            ]))
+            .expect("budget args should build");
+            assert_eq!(input.embedding_token_budget.to_string(), budget);
+        }
     }
 
     #[test]

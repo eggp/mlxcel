@@ -209,7 +209,9 @@ fn modernbert_embed_base_handles_a_document_beyond_4096_tokens() {
         return;
     };
     let _mlx = mlx_guard();
-    let engine = engine(&dir);
+    // The budget off keeps the long and the short text in one micro-batch;
+    // with it on, the long text would run alone and match its solo vector.
+    let engine = engine(&dir).with_token_budget(0);
     // Well past the 128-token local window, so the alternating local layers
     // are exercised over dozens of windows rather than one.
     let sentence = "t-SNE embeds high-dimensional points into two dimensions while preserving \

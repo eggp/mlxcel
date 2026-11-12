@@ -362,6 +362,19 @@ fn build_startup_input_propagates_image_limits() {
 }
 
 #[test]
+fn build_startup_input_propagates_embedding_token_budget() {
+    let mut args = sample_args();
+    args.embedding_token_budget = 1234;
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(input.embedding_token_budget, 1234);
+
+    let mut args = sample_args();
+    args.embedding_token_budget = 0;
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(input.embedding_token_budget, 0);
+}
+
+#[test]
 fn build_startup_input_propagates_pp_layers() {
     let mut args = sample_args();
     args.pp_layers = Some("0-15,16-31".to_string());

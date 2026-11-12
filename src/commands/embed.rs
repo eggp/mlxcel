@@ -73,7 +73,9 @@ pub(crate) struct EmbedArgs {
     #[arg(long = "max-length", value_name = "N")]
     pub(crate) max_length: Option<usize>,
 
-    /// Inputs per forward pass.
+    /// Most inputs per forward pass.
+    ///
+    /// `--embedding-token-budget` can close a micro-batch earlier.
     #[arg(long = "batch-size", default_value_t = 16, value_name = "N")]
     pub(crate) batch_size: usize,
 

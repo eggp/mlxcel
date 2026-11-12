@@ -33,7 +33,7 @@ use super::normalize::{EmbdNormalize, apply_embd_normalize};
 use super::pooling::truncate_dimensions;
 use super::tokenize::{EncodeOptions, EncodedBatch, EncodedRow, encode_row, truncate_token_ids};
 
-/// Default `--embedding-batch-size`: texts per forward pass.
+/// Default `--embedding-batch-size`: most texts per forward pass.
 pub const DEFAULT_EMBEDDING_BATCH_SIZE: usize = 16;
 
 /// Default `--embedding-token-budget`: padded tokens (rows x the longest
@@ -204,7 +204,7 @@ impl EmbeddingEngine {
         self.loaded.model_type
     }
 
-    /// Texts per forward pass.
+    /// Most texts per forward pass.
     pub fn batch_size(&self) -> usize {
         self.batch_size
     }

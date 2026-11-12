@@ -202,9 +202,11 @@ fn engine_token_budget_defaults_to_4096_and_zero_turns_it_off() {
     assert_eq!(engine(4).with_token_budget(0).token_budget(), None);
 }
 
-/// The stub model, recording the `[B, L]` shape of every micro-batch it runs.
+/// The stub model, recording the `[B, L]` shape of every micro-batch it runs
+/// and reporting `pad_to` as its fixed sequence width.
 struct ShapeRecorder {
     inner: StubEmbeddingModel,
+    pad_to: Option<usize>,
     shapes: Rc<RefCell<Vec<Vec<i32>>>>,
 }
 
@@ -223,6 +225,10 @@ impl EmbeddingModel for ShapeRecorder {
     fn embedding_dim(&self) -> usize {
         self.inner.embedding_dim()
     }
+
+    fn pad_to_max_length(&self) -> Option<usize> {
+        self.pad_to
+    }
 }
 
 /// Micro-batch shapes for four one-token rows and two six-token rows,
@@ -232,6 +238,7 @@ fn recorded_micro_batches(token_budget: usize) -> Vec<Vec<i32>> {
     let mut loaded = stub_loaded_model(false);
     loaded.model = Box::new(ShapeRecorder {
         inner: StubEmbeddingModel::new(),
+        pad_to: None,
         shapes: Rc::clone(&shapes),
     });
     let e = EmbeddingEngine::new(loaded, 16).with_token_budget(token_budget);
@@ -251,6 +258,23 @@ fn engine_cuts_micro_batches_by_the_token_budget_it_was_given() {
         vec![vec![6, 6]]
     );
     assert_eq!(recorded_micro_batches(0), vec![vec![6, 6]]);
+}
+
+#[test]
+fn engine_counts_a_fixed_pad_width_against_the_token_budget() {
+    let shapes = Rc::new(RefCell::new(Vec::new()));
+    let mut loaded = stub_loaded_model(false);
+    loaded.model = Box::new(ShapeRecorder {
+        inner: StubEmbeddingModel::new(),
+        pad_to: Some(8),
+        shapes: Rc::clone(&shapes),
+    });
+    let e = EmbeddingEngine::new(loaded, 16).with_token_budget(16);
+    let rows = vec![vec![3], vec![4], vec![5], vec![6]];
+    e.embed_tokens(&rows, &EmbedOptions::default()).unwrap();
+    // Every row runs 8 wide, so 2 x 8 fills the budget; counted at their raw
+    // length of 1, all four rows would fit in one micro-batch.
+    assert_eq!(shapes.take(), vec![vec![2, 8], vec![2, 8]]);
 }
 
 #[test]

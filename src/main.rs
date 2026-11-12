@@ -1874,7 +1874,7 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "MLXCEL_IMAGE_MODEL", value_name = "PATH_OR_REPO_ID")]
     image_model: Option<String>,
 
-    /// Texts per embedding forward pass (default: 16)
+    /// Most texts per embedding forward pass (default: 16)
     ///
     /// `/v1/embeddings` sorts text inputs by token length and cuts them into
     /// micro-batches of at most this many texts and at most
