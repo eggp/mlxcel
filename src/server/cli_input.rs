@@ -157,7 +157,7 @@ pub struct ServerStartupInput {
     /// `--image-model`: resolved image-generation checkpoint directory served on
     /// `/v1/images/*` next to the chat model.
     pub image_model_path: Option<PathBuf>,
-    /// `--embedding-batch-size`: texts per embedding forward pass.
+    /// `--embedding-batch-size`: most texts per embedding forward pass.
     pub embedding_batch_size: usize,
     /// `--embedding-token-budget`: most padded tokens per embedding forward
     /// pass; `0` turns the budget off.
