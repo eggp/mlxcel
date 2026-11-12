@@ -126,6 +126,30 @@ impl EmbeddingWorker {
     where
         L: FnOnce() -> anyhow::Result<LoadedEmbeddingModel> + Send + 'static,
     {
+        Self::spawn_with_cache_clear(
+            thread_name,
+            queue_depth,
+            request_timeout,
+            batch_size,
+            mlxcel_core::clear_memory_cache,
+            loader,
+        )
+    }
+
+    /// [`Self::spawn`] with the buffer-cache release the worker runs after
+    /// each request passed in, so a test can count the calls.
+    fn spawn_with_cache_clear<C, L>(
+        thread_name: &str,
+        queue_depth: usize,
+        request_timeout: Duration,
+        batch_size: usize,
+        clear_cache: C,
+        loader: L,
+    ) -> anyhow::Result<Self>
+    where
+        C: Fn() + Send + 'static,
+        L: FnOnce() -> anyhow::Result<LoadedEmbeddingModel> + Send + 'static,
+    {
         let capacity = queue_depth.max(1);
         let request_timeout = if request_timeout == Duration::ZERO {
             Duration::from_secs(crate::server::config::DEFAULT_EMBEDDING_REQUEST_TIMEOUT_SECS)
@@ -137,7 +161,7 @@ impl EmbeddingWorker {
 
         let handle = thread::Builder::new()
             .name(thread_name.to_string())
-            .spawn(move || worker_loop(loader, batch_size, command_rx, ready_tx))
+            .spawn(move || worker_loop(loader, batch_size, clear_cache, command_rx, ready_tx))
             .map_err(|e| anyhow::anyhow!("failed to spawn embedding worker thread: {e}"))?;
 
         match ready_rx.recv() {
@@ -268,13 +292,15 @@ impl Drop for EmbeddingWorker {
 }
 
 /// Body of the worker thread: install the stream, load the model, serve.
-fn worker_loop<L>(
+fn worker_loop<L, C>(
     loader: L,
     batch_size: usize,
+    clear_cache: C,
     commands: mpsc::Receiver<EmbeddingCommand>,
     ready: mpsc::Sender<Result<EmbeddingWorkerInfo, String>>,
 ) where
     L: FnOnce() -> anyhow::Result<LoadedEmbeddingModel>,
+    C: Fn(),
 {
     let stream = new_thread_local_generation_stream();
     install_thread_local_default_stream(stream.as_ref());
@@ -308,39 +334,47 @@ fn worker_loop<L>(
     // worker: the engine is owned and used single-threadedly and holds no
     // cross-call invariants a recovered panic could leave torn.
     while let Ok(command) = commands.recv() {
-        match command {
+        let (result, respond) = match command {
             EmbeddingCommand::Texts {
                 texts,
                 opts,
                 respond,
-            } => {
-                let result = run_guarded(stream.as_ref(), || {
+            } => (
+                run_guarded(stream.as_ref(), || {
                     engine.embed_texts(&texts, &opts).map_err(Into::into)
-                });
-                let _ = respond.send(result);
-            }
+                }),
+                respond,
+            ),
             EmbeddingCommand::Tokens {
                 rows,
                 opts,
                 respond,
-            } => {
-                let result = run_guarded(stream.as_ref(), || {
+            } => (
+                run_guarded(stream.as_ref(), || {
                     engine.embed_tokens(&rows, &opts).map_err(Into::into)
-                });
-                let _ = respond.send(result);
-            }
+                }),
+                respond,
+            ),
             EmbeddingCommand::Image {
                 image,
                 opts,
                 respond,
-            } => {
-                let result = run_guarded(stream.as_ref(), || {
+            } => (
+                run_guarded(stream.as_ref(), || {
                     engine.embed_image(*image, &opts).map_err(Into::into)
-                });
-                let _ = respond.send(result);
-            }
+                }),
+                respond,
+            ),
             EmbeddingCommand::Shutdown => break,
-        }
+        };
+        // The request's buffers would otherwise stay in the MLX buffer cache
+        // until the cache limit evicts them. Once per request, not per
+        // micro-batch: frequent releases cost throughput. Before the reply,
+        // so the release is part of the request: it runs after success,
+        // error and recovered panic alike, and the caller sees the released
+        // state.
+        clear_cache();
+        let _ = respond.send(result);
     }
 }
 
