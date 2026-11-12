@@ -18,10 +18,12 @@
 //! an ordinary `Qwen3ForCausalLM` (`model_type: qwen3`) with a
 //! sentence-transformers `1_Pooling` module declaring
 //! `pooling_mode_lasttoken: true`, and the sentence embedding is the hidden
-//! state at the `<|endoftext|>` token the tokenizer appends. Because the last
-//! real token attends every earlier token, a causal mask over a right-padded
-//! batch produces exactly the single-row result: padding sits after the
-//! pooled position and is blocked as a key everywhere.
+//! state at the `<|endoftext|>` token the tokenizer appends. Under causal
+//! attention the padding of a right-padded batch does not change a real
+//! position: padding sits after the real tokens, so no real query ever sees a
+//! padding key. The forward pass therefore passes no mask array and relies on the
+//! batch being right-padded; the outputs at padding positions are never
+//! pooled.
 //!
 //! The only backbone work is reaching the hidden states without the head:
 //! [`Qwen3Model::forward_hidden`] stops after the final norm, so no
@@ -35,7 +37,6 @@
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
-use mlxcel_core::utils::create_causal_padding_mask;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde_json::Value;
@@ -80,7 +81,7 @@ impl Qwen3EmbeddingModel {
 
     /// Build the model from an already sanitized weight map.
     ///
-    /// Split from [`Self::load`] so the mask and pooling behaviour can be
+    /// Split from [`Self::load`] so the padding and pooling behaviour can be
     /// exercised on a synthetic checkpoint-free model.
     pub(crate) fn from_weights(
         weights: &WeightMap,
@@ -100,15 +101,14 @@ impl Qwen3EmbeddingModel {
 
     /// Run the causal backbone and the final norm, returning the
     /// `[B, L, hidden_size]` hidden states before pooling.
-    pub(crate) fn forward_hidden(
-        &self,
-        input_ids: &MlxArray,
-        attention_mask: &MlxArray,
-    ) -> UniquePtr<MlxArray> {
-        let mask = create_causal_padding_mask(attention_mask, 0);
+    ///
+    /// `input_ids` must be right-padded: without a mask array a padding key
+    /// is visible to every later position, which is harmless only when all
+    /// later positions are padding too.
+    pub(crate) fn forward_hidden(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
         let mut caches = self.model.make_caches();
         self.model
-            .forward_hidden(input_ids, None, &mut caches, Some(&mask))
+            .forward_hidden(input_ids, None, &mut caches, None)
     }
 }
 
@@ -118,7 +118,7 @@ impl EmbeddingModel for Qwen3EmbeddingModel {
             bail!("Qwen3-Embedding is a text-only embedder and does not accept images");
         }
 
-        let hidden = self.forward_hidden(batch.input_ids, batch.attention_mask);
+        let hidden = self.forward_hidden(batch.input_ids);
         let pooled = pool(&hidden, batch.attention_mask, self.pooling);
 
         Ok(EmbeddingOutput {
