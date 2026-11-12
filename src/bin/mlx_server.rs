@@ -796,13 +796,27 @@ struct ServerArgs {
     /// Texts per embedding forward pass (default: 16)
     ///
     /// `/v1/embeddings` sorts text inputs by token length and cuts them into
-    /// micro-batches of this size, each right-padded to its longest member.
+    /// micro-batches of at most this many texts and at most
+    /// `--embedding-token-budget` padded tokens, each right-padded to its
+    /// longest member.
     #[arg(
         long = "embedding-batch-size",
         env = "MLXCEL_EMBEDDING_BATCH_SIZE",
         default_value_t = 16
     )]
     embedding_batch_size: usize,
+
+    /// Padded tokens per embedding forward pass; 0 turns the budget off (default: 4096)
+    ///
+    /// A micro-batch closes before its text count times the padded length of
+    /// its longest member would exceed this budget, so a few long texts do not
+    /// pad many short ones; a text longer than the budget runs alone.
+    #[arg(
+        long = "embedding-token-budget",
+        env = "MLXCEL_EMBEDDING_TOKEN_BUDGET",
+        default_value_t = 4096
+    )]
+    embedding_token_budget: usize,
 
     /// Token cap per embedding input (default: derived from the checkpoint)
     ///
@@ -2909,6 +2923,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         embedding_model_path,
         image_model_path,
         embedding_batch_size: args.embedding_batch_size,
+        embedding_token_budget: args.embedding_token_budget,
         embedding_max_length: args.embedding_max_length,
         embedding_queue_depth: args.embedding_queue_depth,
         embedding_request_timeout_secs: args.embedding_request_timeout_secs,
@@ -3699,6 +3714,35 @@ mod tests {
         assert_eq!(args.responses_background_max_jobs, 3);
         assert_eq!(args.responses_background_ephemeral_ttl_secs, 45);
         assert_eq!(args.responses_background_event_log_bytes, 1024);
+    }
+
+    #[test]
+    fn embedding_token_budget_defaults_to_4096_and_zero_parses_as_off() {
+        let _lock = CLI_ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _unset = ScopedEnv::unset(&["MLXCEL_EMBEDDING_TOKEN_BUDGET"]);
+
+        let args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
+        assert_eq!(args.embedding_token_budget, 4096);
+        assert_eq!(
+            args.embedding_token_budget,
+            mlxcel::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET
+        );
+
+        let args = parse_server_args(&[
+            "mlxcel-server",
+            "-m",
+            "models/foo",
+            "--embedding-token-budget",
+            "0",
+        ]);
+        assert_eq!(args.embedding_token_budget, 0);
+
+        let _env = ScopedEnv::set(&[("MLXCEL_EMBEDDING_TOKEN_BUDGET", "2048")]);
+        let args = parse_server_args(&["mlxcel-server", "-m", "models/foo"]);
+        assert_eq!(args.embedding_token_budget, 2048);
     }
 
     #[test]

@@ -64,6 +64,7 @@ fn sample_args() -> crate::ServeArgs {
         embedding_model: None,
         image_model: None,
         embedding_batch_size: 16,
+        embedding_token_budget: 4096,
         embedding_max_length: None,
         embedding_queue_depth: 8,
         embedding_request_timeout_secs: 120,

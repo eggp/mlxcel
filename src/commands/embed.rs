@@ -77,6 +77,19 @@ pub(crate) struct EmbedArgs {
     #[arg(long = "batch-size", default_value_t = 16, value_name = "N")]
     pub(crate) batch_size: usize,
 
+    /// Padded tokens per forward pass; 0 turns the budget off.
+    ///
+    /// A micro-batch closes before its input count times the padded length of
+    /// its longest member would exceed this budget; an input longer than the
+    /// budget runs alone. Same option and variable as the server's.
+    #[arg(
+        long = "embedding-token-budget",
+        env = "MLXCEL_EMBEDDING_TOKEN_BUDGET",
+        default_value_t = 4096,
+        value_name = "N"
+    )]
+    pub(crate) embedding_token_budget: usize,
+
     /// Model-store root used to resolve a repo-id (defaults to the global store).
     #[arg(long = "models-dir", env = "MLXCEL_MODELS_DIR", value_name = "PATH")]
     pub(crate) models_dir: Option<PathBuf>,
@@ -175,7 +188,8 @@ pub(crate) fn run_embed(args: EmbedArgs) -> Result<()> {
         },
     )
     .with_context(|| format!("failed to load embedding model {}", model_dir.display()))?;
-    let engine = EmbeddingEngine::new(loaded, args.batch_size);
+    let engine = EmbeddingEngine::new(loaded, args.batch_size)
+        .with_token_budget(args.embedding_token_budget);
     engine
         .validate_dimensions(args.dimensions)
         .map_err(|e| anyhow!("{e}"))?;
@@ -349,6 +363,7 @@ mod tests {
             json: false,
             max_length: None,
             batch_size: 16,
+            embedding_token_budget: 4096,
             models_dir: None,
         }
     }

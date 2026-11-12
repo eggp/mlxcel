@@ -63,8 +63,8 @@ mod loader_tests;
 mod real_checkpoint_tests;
 
 pub use engine::{
-    DEFAULT_EMBEDDING_BATCH_SIZE, EmbedOptions, EmbedReply, EmbeddingEngine, EmbeddingEngineError,
-    EmbeddingVector,
+    DEFAULT_EMBEDDING_BATCH_SIZE, DEFAULT_EMBEDDING_TOKEN_BUDGET, EmbedOptions, EmbedReply,
+    EmbeddingEngine, EmbeddingEngineError, EmbeddingVector,
 };
 pub use limits::{EMBEDDING_MAX_LENGTH_CAP, EmbeddingLimits};
 pub use loader::{

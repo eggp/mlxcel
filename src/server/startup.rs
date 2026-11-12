@@ -265,6 +265,10 @@ pub struct ServerStartupConfig {
     /// `--embedding-batch-size`. Forwarded to
     /// [`super::config::ServerConfig::embedding_batch_size`].
     pub embedding_batch_size: usize,
+    /// `--embedding-token-budget`; `0` turns the budget off. Read only when
+    /// the embedding worker starts, so it is not mirrored into `ServerConfig`
+    /// (and stays out of the runtime-settings schema).
+    pub embedding_token_budget: usize,
     /// `--embedding-max-length`. Forwarded to
     /// [`super::config::ServerConfig::embedding_max_length`].
     pub embedding_max_length: Option<usize>,
@@ -734,6 +738,7 @@ impl Default for ServerStartupConfig {
             embedding_model_path: None,
             image_model_path: None,
             embedding_batch_size: crate::server::config::DEFAULT_EMBEDDING_BATCH_SIZE,
+            embedding_token_budget: crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
             embedding_max_length: None,
             embedding_queue_depth: crate::server::config::DEFAULT_EMBEDDING_QUEUE_DEPTH,
             embedding_request_timeout_secs:
@@ -4773,12 +4778,14 @@ fn resolve_embedding_provider(
         path = %path.display(),
         model_id = %model_id,
         batch_size = config.embedding_batch_size,
+        token_budget = startup.embedding_token_budget,
         "Loading embedding model for /v1/embeddings"
     );
     match crate::server::embedding_worker::EmbeddingWorkerProvider::load(
         &path,
         model_id,
         config.embedding_batch_size,
+        startup.embedding_token_budget,
         config.embedding_queue_depth,
         request_timeout,
         load_options,
@@ -4792,6 +4799,7 @@ fn resolve_embedding_provider(
                 multi_vector = info.multi_vector,
                 supports_images = info.supports_images,
                 batch_size = info.batch_size,
+                token_budget = ?info.token_budget,
                 "Embedding model ready on /v1/embeddings"
             );
             Ok(Some(Arc::new(provider)))
