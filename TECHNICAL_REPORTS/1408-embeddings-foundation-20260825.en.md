@@ -118,12 +118,12 @@ POST /v1/embeddings
 | `src/embeddings/limits.rs` | `EmbeddingLimits::derive`, `derive_max_length`, `resolve_pad_token_id` (`pad_token`, then `eos_token`, then 0), `resolve_vocab_size` (`vocab_size`, then `text_config.vocab_size`, then the tokenizer), `config_normalize_flag`. |
 | `src/embeddings/tokenize.rs` | `EncodedRow`, `EncodedBatch::from_rows` (right padding, optional fixed width), `encode_row` with HuggingFace special-token masks or an inferred mask for other tokenizers, `encode_pair_row` and `encode_pairs` for the reranker issue, `strip_padding_and_truncation`. |
 | `src/embeddings/loader.rs` | `load_embedding_model[_with_options]`, `build_family_model` (the per-family dispatcher), `load_embedding_weights`, `quantization_params`, `finish_loaded_model`. |
-| `src/embeddings/engine.rs` | `EmbeddingEngine` with `embed_texts`, `embed_tokens`, `embed_image`, `run_rows`, `forward_batch`, `postprocess`; `EmbedOptions`, `EmbedReply`, `EmbeddingVector`, `EmbeddingEngineError`. |
+| `src/embeddings/engine.rs` | `EmbeddingEngine` with `embed_texts`, `embed_texts_until`, `embed_tokens`, `embed_tokens_until`, `embed_image`, `run_rows`, `forward_batch`, `postprocess`; `EmbedOptions`, `EmbedReply`, `EmbeddingVector`, `EmbeddingEngineError`. |
 | `src/model_metadata.rs`, `src/models/mod.rs` | `ModelKind::Embedding`, `is_embedding_model_type`, thirteen `ModelType` variants under the `Embedding` family in `mlxcel arch`, registrations with `weight: None` and an adapter rejection message. |
 | `src/models/detection.rs` | `is_embedding_checkpoint` and the rules in section 2.1, called before the `model_type` match. |
 | `src/loading/mod.rs` | `load_model` bails for `ModelKind::Embedding` with the route pointer. |
 | `src/distributed/tensor_parallel/inference.rs` | Placeholder arms so the fallback architecture table stays total. |
-| `src/server/embedding_model.rs` | `EmbeddingModelProvider` trait and `EmbeddingError { QueueFull, Timeout, InvalidInput, Internal }`. |
+| `src/server/embedding_model.rs` | `EmbeddingModelProvider` trait and `EmbeddingError { QueueFull, Timeout, Cancelled, InvalidInput, Internal }`. |
 | `src/server/embedding_worker.rs` | `EmbeddingWorker`, `worker_loop`, `run_guarded`, `EmbeddingWorkerProvider`. |
 | `src/server/routes/embeddings.rs`, `src/server/types/embeddings.rs` | The handler, validation order, error mapping, the untagged `EmbeddingInput` enum, `EmbeddingEncoding`, base64 helpers, `EmbeddingData::from_vector`. |
 | `src/server/app.rs`, `routes/models.rs`, `state.rs`, `startup.rs`, `config.rs`, `cli_input.rs` | Route mounting for `/v1/embeddings` and `/embeddings`, the `/v1/models` entry, the `embedding_model` slot, `resolve_embedding_source` and `resolve_embedding_provider`, the five config fields and their defaults, `env_fallback_embedding_model`. |
@@ -141,6 +141,7 @@ POST /v1/embeddings
 | 501 | `not_implemented` | No embedding model loaded |
 | 503 | `server_busy` | Worker queue full |
 | 504 | `server_timeout` | Worker reply timeout |
+| 499 | `client_closed_request` | Client disconnected before the reply; a queued request is skipped, a running text or token request stops at the next micro-batch boundary |
 | 500 | `server_error` | Forward pass failure or a recovered worker panic |
 
 ---

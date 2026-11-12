@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 use super::{EmbeddingCommand, EmbeddingWork, EmbeddingWorker, EmbeddingWorkerProvider, Reply};
 use crate::embeddings::stub::{STUB_DIM, STUB_MAX_LENGTH, STUB_VOCAB_SIZE, stub_loaded_model};
 use crate::embeddings::{
-    EmbedOptions, EmbeddingBatch, EmbeddingEngine, EmbeddingModel, EmbeddingOutput,
+    EmbedOptions, EmbedReply, EmbeddingBatch, EmbeddingEngine, EmbeddingModel, EmbeddingOutput,
     LoadedEmbeddingModel,
 };
 use crate::server::embedding_model::{EmbeddingError, EmbeddingModelProvider};
@@ -710,18 +710,48 @@ fn queued_request_whose_caller_is_gone_runs_zero_micro_batches() {
     assert_eq!(gated.clears.load(Ordering::SeqCst), 1);
 }
 
+/// A request of `count` items of one input kind, each item one micro-batch
+/// slot, so `count / GATED_BATCH_SIZE` micro-batches.
+type GatedRequest =
+    fn(&EmbeddingWorker, u32, CancellationToken) -> Result<EmbedReply, EmbeddingError>;
+
+fn token_request(
+    worker: &EmbeddingWorker,
+    count: u32,
+    cancel: CancellationToken,
+) -> Result<EmbedReply, EmbeddingError> {
+    worker.embed_tokens(token_rows(count), EmbedOptions::default(), cancel)
+}
+
+fn text_request(
+    worker: &EmbeddingWorker,
+    count: u32,
+    cancel: CancellationToken,
+) -> Result<EmbedReply, EmbeddingError> {
+    let texts = vec!["hello".to_string(); count as usize];
+    worker.embed_texts(texts, EmbedOptions::default(), cancel)
+}
+
 #[test]
 fn in_flight_request_stops_at_next_micro_batch_boundary_and_serves_next() {
+    in_flight_request_stops_and_the_next_is_served(token_request);
+}
+
+#[test]
+fn in_flight_text_request_stops_at_next_micro_batch_boundary_and_serves_next() {
+    in_flight_request_stops_and_the_next_is_served(text_request);
+}
+
+fn in_flight_request_stops_and_the_next_is_served(request: GatedRequest) {
     let gated = gated_worker(Duration::from_secs(30));
     let worker = &gated.worker;
     let release = gated.batch_release;
     let cancel = CancellationToken::new();
 
     std::thread::scope(|scope| {
-        // 6 rows are 3 micro-batches.
+        // 6 items are 3 micro-batches.
         let caller_cancel = cancel.clone();
-        let stopped = scope
-            .spawn(|| worker.embed_tokens(token_rows(6), EmbedOptions::default(), caller_cancel));
+        let stopped = scope.spawn(|| request(worker, 6, caller_cancel));
         assert_eq!(gated.batch_entered.recv_timeout(WAIT), Ok(0));
 
         // Batch 0 is held at the gate, so the cancellation lands inside it;
@@ -745,12 +775,7 @@ fn in_flight_request_stops_at_next_micro_batch_boundary_and_serves_next() {
     // With the release sender gone the gate holds no batch, so the next
     // request (2 micro-batches) runs straight through.
     drop(release);
-    let live = worker
-        .embed_tokens(
-            token_rows(4),
-            EmbedOptions::default(),
-            CancellationToken::new(),
-        )
+    let live = request(worker, 4, CancellationToken::new())
         .expect("the worker serves the next request after a stopped one");
     assert_eq!(live.vectors.len(), 4);
     assert_eq!(gated.batches_run.load(Ordering::SeqCst), 3);

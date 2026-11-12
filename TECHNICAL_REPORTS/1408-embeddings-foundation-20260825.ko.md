@@ -71,7 +71,7 @@ causal과 window 빌더는 `create_causal_mask_with_left_padding`과 같은 구�
 
 ### 2.5 오디오 워커의 admission 설계를 따르는 전용 워커 스레드
 
-`EmbeddingWorker`는 스레드 로컬 기본 스트림을 설치하고 `LoadedEmbeddingModel`을 자기 자신에 로드한 뒤 bounded `mpsc::SyncSender`의 명령을 처리하는 스레드 하나를 소유합니다. 큐가 가득 찼을 때의 `try_send`는 `EmbeddingError::QueueFull`(HTTP 503)을, `recv_timeout`은 `EmbeddingError::Timeout`(HTTP 504, 진행 중인 MLX 작업은 취소되지 않음)을 반환하며, 모든 엔진 호출은 `catch_unwind` 아래에서 실행된 뒤 스트림을 동기화하므로 패닉을 일으킨 요청 하나가 워커를 죽이지 않습니다. 모델, 토크나이저, 모든 배열은 워커 스레드에 있고 HTTP 쪽은 `Vec<f32>`만 봅니다. 큐 깊이와 타임아웃은 오디오 값(8과 120초)을 기본값으로 씁니다. 채팅 스케줄러에 임베딩 작업을 얹는 대신 `AudioWorker`를 그대로 따랐으므로 채팅과 임베딩은 스트림을 공유하지 않습니다.
+`EmbeddingWorker`는 스레드 로컬 기본 스트림을 설치하고 `LoadedEmbeddingModel`을 자기 자신에 로드한 뒤 bounded `mpsc::SyncSender`의 명령을 처리하는 스레드 하나를 소유합니다. 큐가 가득 찼을 때의 `try_send`는 `EmbeddingError::QueueFull`(HTTP 503)을, `recv_timeout`은 `EmbeddingError::Timeout`(HTTP 504)을 반환하고 요청을 취소하며(큐에 대기 중인 명령은 건너뛰고, 실행 중인 텍스트 또는 토큰 명령은 다음 마이크로배치 경계에서 멈춤), 모든 엔진 호출은 `catch_unwind` 아래에서 실행된 뒤 스트림을 동기화하므로 패닉을 일으킨 요청 하나가 워커를 죽이지 않습니다. 모델, 토크나이저, 모든 배열은 워커 스레드에 있고 HTTP 쪽은 `Vec<f32>`만 봅니다. 큐 깊이와 타임아웃은 오디오 값(8과 120초)을 기본값으로 씁니다. 채팅 스케줄러에 임베딩 작업을 얹는 대신 `AudioWorker`를 그대로 따랐으므로 채팅과 임베딩은 스트림을 공유하지 않습니다.
 
 ### 2.6 체크포인트 한 개 또는 두 개에 대한 시작 의미론
 
@@ -118,12 +118,12 @@ POST /v1/embeddings
 | `src/embeddings/limits.rs` | `EmbeddingLimits::derive`, `derive_max_length`, `resolve_pad_token_id`(`pad_token`, 다음 `eos_token`, 다음 0), `resolve_vocab_size`(`vocab_size`, 다음 `text_config.vocab_size`, 다음 토크나이저), `config_normalize_flag`. |
 | `src/embeddings/tokenize.rs` | `EncodedRow`, `EncodedBatch::from_rows`(오른쪽 패딩, 선택적 고정 폭), HuggingFace 특수 토큰 마스크 또는 다른 토크나이저용 추론 마스크를 쓰는 `encode_row`, 리랭커 이슈용 `encode_pair_row`와 `encode_pairs`, `strip_padding_and_truncation`. |
 | `src/embeddings/loader.rs` | `load_embedding_model[_with_options]`, 패밀리 디스패처 `build_family_model`, `load_embedding_weights`, `quantization_params`, `finish_loaded_model`. |
-| `src/embeddings/engine.rs` | `embed_texts`, `embed_tokens`, `embed_image`, `run_rows`, `forward_batch`, `postprocess`를 갖춘 `EmbeddingEngine`; `EmbedOptions`, `EmbedReply`, `EmbeddingVector`, `EmbeddingEngineError`. |
+| `src/embeddings/engine.rs` | `embed_texts`, `embed_texts_until`, `embed_tokens`, `embed_tokens_until`, `embed_image`, `run_rows`, `forward_batch`, `postprocess`를 갖춘 `EmbeddingEngine`; `EmbedOptions`, `EmbedReply`, `EmbeddingVector`, `EmbeddingEngineError`. |
 | `src/model_metadata.rs`, `src/models/mod.rs` | `ModelKind::Embedding`, `is_embedding_model_type`, `mlxcel arch`의 `Embedding` 패밀리 아래 열세 개 `ModelType` 변형, `weight: None`과 어댑터 거부 메시지를 갖춘 등록. |
 | `src/models/detection.rs` | `is_embedding_checkpoint`와 2.1절의 규칙, `model_type` match 이전 호출. |
 | `src/loading/mod.rs` | `load_model`이 `ModelKind::Embedding`에 대해 라우트를 가리키며 중단. |
 | `src/distributed/tensor_parallel/inference.rs` | fallback 아키텍처 테이블의 완전성을 유지하는 자리표시 arm. |
-| `src/server/embedding_model.rs` | `EmbeddingModelProvider` 트레이트와 `EmbeddingError { QueueFull, Timeout, InvalidInput, Internal }`. |
+| `src/server/embedding_model.rs` | `EmbeddingModelProvider` 트레이트와 `EmbeddingError { QueueFull, Timeout, Cancelled, InvalidInput, Internal }`. |
 | `src/server/embedding_worker.rs` | `EmbeddingWorker`, `worker_loop`, `run_guarded`, `EmbeddingWorkerProvider`. |
 | `src/server/routes/embeddings.rs`, `src/server/types/embeddings.rs` | 핸들러, 검증 순서, 오류 매핑, untagged `EmbeddingInput` enum, `EmbeddingEncoding`, base64 헬퍼, `EmbeddingData::from_vector`. |
 | `src/server/app.rs`, `routes/models.rs`, `state.rs`, `startup.rs`, `config.rs`, `cli_input.rs` | `/v1/embeddings`와 `/embeddings` 마운트, `/v1/models` 항목, `embedding_model` 슬롯, `resolve_embedding_source`와 `resolve_embedding_provider`, 설정 필드 다섯 개와 기본값, `env_fallback_embedding_model`. |
@@ -141,6 +141,7 @@ POST /v1/embeddings
 | 501 | `not_implemented` | 임베딩 모델이 로드되지 않음 |
 | 503 | `server_busy` | 워커 큐가 가득 참 |
 | 504 | `server_timeout` | 워커 응답 타임아웃 |
+| 499 | `client_closed_request` | 응답 전에 클라이언트 연결이 끊김; 큐에 대기 중인 요청은 건너뛰고, 실행 중인 텍스트 또는 토큰 요청은 다음 마이크로배치 경계에서 멈춤 |
 | 500 | `server_error` | forward pass 실패 또는 복구된 워커 패닉 |
 
 ---
@@ -245,7 +246,7 @@ squash 머지 전 PR에 기록된 리뷰 스레드는 없습니다.
 ### 모니터링
 
 - 패밀리가 서비스되기 시작하면 `/v1/embeddings`의 503과 504 비율을 관찰합니다. 기본값(`--embedding-queue-depth 8`, `--embedding-request-timeout-secs 120`)은 오디오 워커에서 물려받은 것으로 임베딩 워크로드에 맞춰 조정되지 않았습니다.
-- 응답 타임아웃은 HTTP 스레드를 해제하지만 진행 중인 MLX 작업을 취소하지 않습니다. 오디오 워커와 같은 제약입니다.
+- 응답 타임아웃은 클라이언트 연결이 끊겼을 때와 마찬가지로 HTTP 스레드를 해제하고 요청을 취소합니다. 큐에 대기 중인 요청은 건너뛰고, 실행 중인 텍스트 또는 토큰 요청은 다음 마이크로배치 경계에서 멈춥니다. 실행 중인 이미지 요청은 단일 forward pass이므로 끝까지 실행됩니다.
 
 ### 향후 개선
 
