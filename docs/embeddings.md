@@ -230,7 +230,7 @@ mlxcel embed -m mlx-community/embeddinggemma-300m-4bit \
 
 ### Qwen3-Embedding (`Qwen3Embedding`)
 
-The causal Qwen3 backbone with a causal-plus-padding mask and last-token pooling: the sentence embedding is the hidden state at the `<|endoftext|>` the tokenizer appends. Batches are right-padded, which leaves the causal mask over the real tokens identical to the unpadded single-row case. The tied `lm_head` is dropped at load, and the backbone stops at the final norm, so no `[B, L, vocab_size]` logit tensor is ever built.
+The causal Qwen3 backbone with last-token pooling: the sentence embedding is the hidden state at the `<|endoftext|>` the tokenizer appends. The forward pass builds no mask array and runs the built-in causal attention. Batches are right-padded, so padding sits after every real token and no real token attends it, which leaves every real row identical to the unpadded single-row case; pooling picks the last real token from the batch's `attention_mask`. The tied `lm_head` is dropped at load, and the backbone stops at the final norm, so no `[B, L, vocab_size]` logit tensor is ever built.
 
 Queries use `Instruct: {task}\nQuery: {query}` and documents are raw text. Pass the task through `instruction` (or `--instruction`) and the family wraps the text; send the fully formatted string and leave `instruction` unset to do it yourself. `instruction` applies to every input of the request, so a mixed query-and-document batch either splits into two requests or formats its queries in the text itself. `max_length` resolves to the default ceiling of 8192. The checkpoint supports `dimensions` from 32 to 1024.
 
