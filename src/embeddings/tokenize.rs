@@ -48,12 +48,17 @@ pub struct EncodeOptions {
 ///
 /// Encoders read the whole row through a bidirectional mask, so the padding
 /// end does not matter and [`PaddingSide::Right`] keeps the real tokens at
-/// index `0..n`. A causal decoder scored at one position is different: the
-/// generative rerankers read the logits at `L - 1`, which is only the last
-/// real token of every row when the padding sits in front of it.
+/// index `0..n`. A causal decoder scored at one position is different. Read
+/// at the single column `L - 1`, as the generative rerankers read rows they
+/// forward whole, that column is the last real token of every row only when
+/// the padding sits in front of it. Read at each row's own last real token,
+/// as the Qwen3 text reranker reads the tails it forwards after a shared run,
+/// right padding works too: the causal mask hides the trailing padding from
+/// every real token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PaddingSide {
-    /// Real tokens first, padding after them (the embedding engine).
+    /// Real tokens first, padding after them (the embedding engine, and a
+    /// causal decoder read at each row's own last real token).
     #[default]
     Right,
     /// Padding first, real tokens flush against the end of the row.

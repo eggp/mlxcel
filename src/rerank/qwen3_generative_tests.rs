@@ -756,20 +756,28 @@ fn shared_run_scores_match_whole_rows_and_forward_the_run_once() {
         "the run is forwarded once for the request, then only the padded tails"
     );
 
-    // The public entry takes the shared-run path. The two paths differ only
-    // by f32 rounding, so only the exact scores tell them apart: the same
-    // computation repeated gives the same bits.
+    // The request path takes the shared-run path. The scores of the two paths
+    // differ only by f32 rounding, so the positions computed tell them apart.
+    assert!(
+        tails_forwarded < whole_forwarded,
+        "the shared-run path must compute fewer positions for the request's path to show"
+    );
+    let (requested, requested_forwarded, requested_shared) = reranker
+        .score_request(&rows, &|| false)
+        .expect("the request scores");
+    assert_eq!(
+        requested_forwarded, tails_forwarded,
+        "the request path must forward the run once, then only the tails"
+    );
+    assert_eq!(
+        requested_shared, shared,
+        "the request path must choose the run its rows share"
+    );
+    assert!(max_abs_diff(&requested.scores, &tails.scores) < SHARED_RUN_TOLERANCE);
     let scored = reranker
         .score(&RerankItem::text("what is panda?"), &documents, None)
         .expect("scoring succeeds");
-    assert_ne!(
-        tails.scores, whole.scores,
-        "the two paths must round apart for the public entry's path to show"
-    );
-    assert_eq!(
-        scored.scores, tails.scores,
-        "the public entry must score from the shared run"
-    );
+    assert!(max_abs_diff(&scored.scores, &tails.scores) < SHARED_RUN_TOLERANCE);
     assert_eq!(scored.prompt_tokens, tails.prompt_tokens);
 }
 
@@ -840,9 +848,12 @@ fn single_document_request_forwards_its_whole_row() {
     let rows = encoded_rows(&reranker, "what is panda?", &documents);
     assert_eq!(shared_run_len(&rows), 0);
 
-    let (scored, forwarded) = reranker
-        .score_encoded(&rows, shared_run_len(&rows), &|| false)
+    // One row has no padding on either path and computes as many positions,
+    // so only the chosen run length shows which path the request took.
+    let (scored, forwarded, shared) = reranker
+        .score_request(&rows, &|| false)
         .expect("a single document scores");
+    assert_eq!(shared, 0, "a single document must be forwarded whole");
     assert_eq!(forwarded, rows[0].ids.len());
     assert_eq!(scored.prompt_tokens, rows[0].ids.len());
     let through_trait = reranker

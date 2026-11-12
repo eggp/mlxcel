@@ -436,6 +436,21 @@ impl Qwen3Reranker {
             forwarded,
         ))
     }
+
+    /// Score a request's encoded prompt rows from the run they share, the
+    /// step [`Reranker::score_until`] takes once the rows are encoded.
+    ///
+    /// Returns what [`Self::score_encoded`] returns, then the shared-run
+    /// length this step chose, `0` when the rows were forwarded whole.
+    fn score_request(
+        &self,
+        rows: &[EncodedRow],
+        is_abandoned: &dyn Fn() -> bool,
+    ) -> Result<(RerankScores, usize, usize)> {
+        let shared_len = shared_run_len(rows);
+        let (scores, forwarded) = self.score_encoded(rows, shared_len, is_abandoned)?;
+        Ok((scores, forwarded, shared_len))
+    }
 }
 
 /// The token run every row of a request opens with, forwarded once: each
@@ -535,7 +550,7 @@ impl Reranker for Qwen3Reranker {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let (scores, _) = self.score_encoded(&rows, shared_run_len(&rows), is_abandoned)?;
+        let (scores, _, _) = self.score_request(&rows, is_abandoned)?;
         Ok(scores)
     }
 
