@@ -71,7 +71,7 @@ The shared helpers are what make the family ports small: `pool(hidden, mask, mod
 
 ### 2.5 A dedicated worker thread with the audio worker's admission design
 
-`EmbeddingWorker` owns one thread that installs a thread-local default stream, loads the `LoadedEmbeddingModel` on itself and serves commands from a bounded `mpsc::SyncSender`. `try_send` on a full queue returns `EmbeddingError::QueueFull` (HTTP 503), `recv_timeout` returns `EmbeddingError::Timeout` (HTTP 504, the in-flight MLX work is not cancelled), and every engine call runs under `catch_unwind` followed by a stream synchronize so one panicking request does not kill the worker. The model, tokenizer and every array live on the worker thread; the HTTP side only sees `Vec<f32>`. Queue depth and timeout default to the audio values (8 and 120 s). This mirrors `AudioWorker` rather than adding embedding work to the chat scheduler, so chat and embeddings never share a stream.
+`EmbeddingWorker` owns one thread that installs a thread-local default stream, loads the `LoadedEmbeddingModel` on itself and serves commands from a bounded `mpsc::SyncSender`. `try_send` on a full queue returns `EmbeddingError::QueueFull` (HTTP 503), `recv_timeout` returns `EmbeddingError::Timeout` (HTTP 504) and cancels the request (a queued command is skipped, a running text or token command stops at the next micro-batch boundary), and every engine call runs under `catch_unwind` followed by a stream synchronize so one panicking request does not kill the worker. The model, tokenizer and every array live on the worker thread; the HTTP side only sees `Vec<f32>`. Queue depth and timeout default to the audio values (8 and 120 s). This mirrors `AudioWorker` rather than adding embedding work to the chat scheduler, so chat and embeddings never share a stream.
 
 ### 2.6 Startup semantics for one or two checkpoints
 
@@ -245,7 +245,7 @@ No review threads were recorded on the PR before the squash merge.
 ### Monitoring
 
 - Watch the 503 and 504 rates on `/v1/embeddings` once a family is served; the defaults (`--embedding-queue-depth 8`, `--embedding-request-timeout-secs 120`) are inherited from the audio worker and were not tuned for embedding workloads.
-- The reply timeout frees the HTTP thread but does not cancel the in-flight MLX work, the same limitation as the audio worker.
+- The reply timeout frees the HTTP thread and cancels the request, as a dropped client connection does: a queued request is skipped and a running text or token request stops at the next micro-batch boundary. A running image request is a single forward pass and still finishes.
 
 ### Future improvements
 

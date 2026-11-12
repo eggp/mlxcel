@@ -22,6 +22,7 @@
 //! and the route returns a structured `501 Not Implemented`.
 
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 
 use crate::embeddings::EmbeddingEngineError;
 pub use crate::embeddings::{EmbedOptions, EmbedReply, EmbeddingVector, ImageInput};
@@ -35,9 +36,15 @@ pub enum EmbeddingError {
     #[error("embedding worker queue is full")]
     QueueFull,
     /// The worker did not reply within the per-request timeout. Routes map
-    /// this to `504`; the in-flight MLX work is not cancelled.
+    /// this to `504`; a queued request is skipped and an in-flight text or
+    /// token request stops after the current micro-batch.
     #[error("embedding request timed out")]
     Timeout,
+    /// The request's token was cancelled, so the worker skipped it in the
+    /// queue or stopped it at a micro-batch boundary. Routes map this to
+    /// `499`; the caller that cancelled is normally no longer there to read it.
+    #[error("embedding request cancelled")]
+    Cancelled,
     /// The request content is invalid (empty item, token id out of range,
     /// `dimensions` out of range, image for a text-only model). Routes map
     /// this to `400 invalid_request_error`.
@@ -53,6 +60,7 @@ impl From<EmbeddingEngineError> for EmbeddingError {
         match err {
             EmbeddingEngineError::InvalidInput(message) => EmbeddingError::InvalidInput(message),
             EmbeddingEngineError::Internal(message) => EmbeddingError::Internal(message),
+            EmbeddingEngineError::Abandoned => EmbeddingError::Cancelled,
         }
     }
 }
@@ -61,12 +69,19 @@ impl From<EmbeddingEngineError> for EmbeddingError {
 ///
 /// Every method is synchronous and blocking (it waits for the worker's
 /// reply), so routes call it inside `spawn_blocking`.
+///
+/// `cancel` is the caller's way to say it no longer waits: once it is
+/// cancelled, a request still queued is not run and a text or token request
+/// being run stops at the next micro-batch boundary, both with
+/// [`EmbeddingError::Cancelled`]. The provider cancels it itself when the
+/// reply times out. A caller that will not cancel passes a fresh token.
 pub trait EmbeddingModelProvider: Send + Sync {
     /// Embed texts (special tokens added, per-family formatting applied).
     fn embed_texts(
         &self,
         texts: Vec<String>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError>;
 
     /// Embed verbatim token-id rows (no special tokens added).
@@ -74,13 +89,16 @@ pub trait EmbeddingModelProvider: Send + Sync {
         &self,
         token_rows: Vec<Vec<u32>>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError>;
 
-    /// Embed one image (VLM embedders only).
+    /// Embed one image (VLM embedders only). A single forward pass, so
+    /// `cancel` only keeps a queued request from starting.
     fn embed_image(
         &self,
         image: ImageInput,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError>;
 
     /// Served model id, reported in responses and `/v1/models`.

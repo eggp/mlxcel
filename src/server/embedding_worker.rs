@@ -27,7 +27,10 @@
 //! `SyncSender` with `try_send` (full queue = [`EmbeddingError::QueueFull`]),
 //! a per-request reply timeout ([`EmbeddingError::Timeout`]), and
 //! `catch_unwind` around every engine call so one bad request cannot kill
-//! the worker for the rest of the process.
+//! the worker for the rest of the process. Abandonment follows the rerank
+//! worker: each command carries its caller's [`CancellationToken`], a
+//! cancelled command is not started, and a running text or token command
+//! stops at the next micro-batch boundary ([`EmbeddingError::Cancelled`]).
 
 use std::path::Path;
 use std::sync::mpsc;
@@ -39,6 +42,7 @@ use mlxcel_core::streams::{
     install_thread_local_default_stream, new_thread_local_generation_stream,
     synchronize_thread_local_stream,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::embeddings::{
     EmbedOptions, EmbedReply, EmbeddingEngine, EmbeddingLoadOptions, ImageInput,
@@ -74,21 +78,19 @@ pub(crate) struct EmbeddingWorkerInfo {
 
 type Reply = mpsc::Sender<Result<EmbedReply, EmbeddingError>>;
 
+/// The input of one embedding command.
+enum EmbeddingWork {
+    Texts(Vec<String>),
+    Tokens(Vec<Vec<u32>>),
+    Image(Box<ImageInput>),
+}
+
 /// A unit of work plus the channel to reply on.
 enum EmbeddingCommand {
-    Texts {
-        texts: Vec<String>,
+    Embed {
+        work: EmbeddingWork,
         opts: EmbedOptions,
-        respond: Reply,
-    },
-    Tokens {
-        rows: Vec<Vec<u32>>,
-        opts: EmbedOptions,
-        respond: Reply,
-    },
-    Image {
-        image: Box<ImageInput>,
-        opts: EmbedOptions,
+        cancel: CancellationToken,
         respond: Reply,
     },
     Shutdown,
@@ -100,8 +102,9 @@ pub(crate) struct EmbeddingWorker {
     /// Bounded command channel; the `Mutex` makes the handle `Sync` and is
     /// held only for the enqueue, never across inference.
     sender: Mutex<mpsc::SyncSender<EmbeddingCommand>>,
-    /// Per-request reply timeout. Frees the caller's blocking thread; does
-    /// not cancel the in-flight MLX work.
+    /// Per-request reply timeout. Frees the caller's blocking thread and
+    /// cancels the request's token so a queued command is skipped and an
+    /// in-flight text or token command stops after the current micro-batch.
     request_timeout: Duration,
     info: EmbeddingWorkerInfo,
     /// Watcher thread handle; joining it waits for the worker to free the model.
@@ -225,51 +228,52 @@ impl EmbeddingWorker {
         &self,
         texts: Vec<String>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        let (respond, reply) = mpsc::channel();
-        self.dispatch(EmbeddingCommand::Texts {
-            texts,
-            opts,
-            respond,
-        })?;
-        self.wait(reply)
+        self.embed(EmbeddingWork::Texts(texts), opts, cancel)
     }
 
     pub(crate) fn embed_tokens(
         &self,
         rows: Vec<Vec<u32>>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        let (respond, reply) = mpsc::channel();
-        self.dispatch(EmbeddingCommand::Tokens {
-            rows,
-            opts,
-            respond,
-        })?;
-        self.wait(reply)
+        self.embed(EmbeddingWork::Tokens(rows), opts, cancel)
     }
 
     pub(crate) fn embed_image(
         &self,
         image: ImageInput,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        let (respond, reply) = mpsc::channel();
-        self.dispatch(EmbeddingCommand::Image {
-            image: Box::new(image),
-            opts,
-            respond,
-        })?;
-        self.wait(reply)
+        self.embed(EmbeddingWork::Image(Box::new(image)), opts, cancel)
     }
 
-    fn wait(
+    /// Run `work` on the worker thread and wait for the reply.
+    ///
+    /// `cancel` follows [`EmbeddingModelProvider`]: the caller cancels it
+    /// when it stops waiting, and this method cancels it on a reply timeout.
+    fn embed(
         &self,
-        reply: mpsc::Receiver<Result<EmbedReply, EmbeddingError>>,
+        work: EmbeddingWork,
+        opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
+        let (respond, reply) = mpsc::channel();
+        self.dispatch(EmbeddingCommand::Embed {
+            work,
+            opts,
+            cancel: cancel.clone(),
+            respond,
+        })?;
         match reply.recv_timeout(self.request_timeout) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(EmbeddingError::Timeout),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.cancel();
+                Err(EmbeddingError::Timeout)
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err(EmbeddingError::Internal(WORKER_GONE.to_string()))
             }
@@ -351,36 +355,32 @@ fn worker_loop<L, C>(
     // cross-call invariants a recovered panic could leave torn.
     while let Ok(command) = commands.recv() {
         let (result, respond) = match command {
-            EmbeddingCommand::Texts {
-                texts,
+            EmbeddingCommand::Embed {
+                work,
                 opts,
+                cancel,
                 respond,
-            } => (
-                run_guarded(stream.as_ref(), || {
-                    engine.embed_texts(&texts, &opts).map_err(Into::into)
-                }),
-                respond,
-            ),
-            EmbeddingCommand::Tokens {
-                rows,
-                opts,
-                respond,
-            } => (
-                run_guarded(stream.as_ref(), || {
-                    engine.embed_tokens(&rows, &opts).map_err(Into::into)
-                }),
-                respond,
-            ),
-            EmbeddingCommand::Image {
-                image,
-                opts,
-                respond,
-            } => (
-                run_guarded(stream.as_ref(), || {
-                    engine.embed_image(*image, &opts).map_err(Into::into)
-                }),
-                respond,
-            ),
+            } => {
+                if cancel.is_cancelled() {
+                    // Nothing ran, so there is no buffer to release.
+                    let _ = respond.send(Err(EmbeddingError::Cancelled));
+                    continue;
+                }
+                let is_abandoned = || cancel.is_cancelled();
+                let result = run_guarded(stream.as_ref(), || {
+                    match work {
+                        EmbeddingWork::Texts(texts) => {
+                            engine.embed_texts_until(&texts, &opts, &is_abandoned)
+                        }
+                        EmbeddingWork::Tokens(rows) => {
+                            engine.embed_tokens_until(&rows, &opts, &is_abandoned)
+                        }
+                        EmbeddingWork::Image(image) => engine.embed_image(*image, &opts),
+                    }
+                    .map_err(Into::into)
+                });
+                (result, respond)
+            }
             EmbeddingCommand::Shutdown => break,
         };
         // The request's buffers would otherwise stay in the MLX buffer cache
@@ -509,24 +509,27 @@ impl EmbeddingModelProvider for EmbeddingWorkerProvider {
         &self,
         texts: Vec<String>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        self.worker.embed_texts(texts, opts)
+        self.worker.embed_texts(texts, opts, cancel)
     }
 
     fn embed_tokens(
         &self,
         token_rows: Vec<Vec<u32>>,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        self.worker.embed_tokens(token_rows, opts)
+        self.worker.embed_tokens(token_rows, opts, cancel)
     }
 
     fn embed_image(
         &self,
         image: ImageInput,
         opts: EmbedOptions,
+        cancel: CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
-        self.worker.embed_image(image, opts)
+        self.worker.embed_image(image, opts, cancel)
     }
 
     fn model_id(&self) -> &str {

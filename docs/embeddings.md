@@ -431,6 +431,7 @@ A mask is never built as `(1 - m) * C` with a finite `C` in the activation dtype
 | 501 | `not_implemented` | No embedding model loaded: `No embedding model loaded; start with -m <embedding checkpoint> or --embedding-model <path>`. |
 | 503 | `server_busy` | The bounded worker queue is full (`--embedding-queue-depth`). |
 | 504 | `server_timeout` | The worker did not reply within `--embedding-request-timeout-secs`. |
+| 499 | `client_closed_request` | The client disconnected before the reply. The worker skips the request if it is still queued, or stops a text or token request at the next micro-batch boundary; an image request already running finishes. The client that left does not read this response. |
 | 500 | `server_error` | The forward pass failed. |
 
 ## Server flags
@@ -559,6 +560,7 @@ An item is either a bare string or an object with `text`, `image` and/or `image_
 | 501 | `not_implemented` | No reranker loaded: `No reranker loaded; start with -m <sequence-classifier checkpoint> or --reranker-model <path>`. |
 | 503 | `server_busy` | The bounded worker queue is full (`--embedding-queue-depth`, shared with the embedding worker). |
 | 504 | `server_timeout` | The worker did not reply within `--embedding-request-timeout-secs`. |
+| 499 | `client_closed_request` | The client disconnected before the reply. The worker skips the request if it is still queued, or stops it at the next micro-batch boundary. The client that left does not read this response. |
 | 500 | `server_error` | The forward pass failed. |
 
 ### Reranker flags

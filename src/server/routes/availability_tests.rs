@@ -38,6 +38,7 @@ impl EmbeddingModelProvider for SideEmbeddingProvider {
         &self,
         _texts: Vec<String>,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         unreachable!("availability preflight must prevent embedding dispatch")
     }
@@ -46,6 +47,7 @@ impl EmbeddingModelProvider for SideEmbeddingProvider {
         &self,
         _token_rows: Vec<Vec<u32>>,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         unreachable!("availability preflight must prevent embedding dispatch")
     }
@@ -54,6 +56,7 @@ impl EmbeddingModelProvider for SideEmbeddingProvider {
         &self,
         _image: ImageInput,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         unreachable!("availability preflight must prevent embedding dispatch")
     }

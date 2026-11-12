@@ -43,7 +43,12 @@ impl ImageEmbeddingProvider {
 }
 
 impl EmbeddingModelProvider for ImageEmbeddingProvider {
-    fn embed_texts(&self, _: Vec<String>, _: EmbedOptions) -> Result<EmbedReply, EmbeddingError> {
+    fn embed_texts(
+        &self,
+        _: Vec<String>,
+        _: EmbedOptions,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
 
@@ -51,11 +56,17 @@ impl EmbeddingModelProvider for ImageEmbeddingProvider {
         &self,
         _: Vec<Vec<u32>>,
         _: EmbedOptions,
+        _: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
 
-    fn embed_image(&self, _: ImageInput, _: EmbedOptions) -> Result<EmbedReply, EmbeddingError> {
+    fn embed_image(
+        &self,
+        _: ImageInput,
+        _: EmbedOptions,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
 

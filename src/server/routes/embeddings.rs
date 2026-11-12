@@ -30,6 +30,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::embeddings::{EmbdNormalize, EmbedOptions, EmbeddingVector, ImageInput};
 use crate::server::AppState;
@@ -67,6 +68,7 @@ pub(crate) fn embedding_error_response(err: EmbeddingError) -> ErrorResponse {
         EmbeddingError::Timeout => {
             ErrorResponse::gateway_timeout("Embedding request timed out. Please try again later.")
         }
+        EmbeddingError::Cancelled => ErrorResponse::client_closed_request(),
         EmbeddingError::InvalidInput(message) => invalid_request(message),
         EmbeddingError::Internal(message) => {
             ErrorResponse::internal_server_error(format!("embedding inference failed: {message}"))
@@ -141,11 +143,13 @@ async fn fetch_images(
 
 /// Run the provider calls for one request on the calling (blocking) thread
 /// and return the vectors in item order plus the total prompt tokens.
+/// Every call carries `cancel`, so a gone caller stops all of them.
 fn embed_items(
     provider: &dyn EmbeddingModelProvider,
     items: &[EmbedItem],
     images: Vec<(usize, ImageInput)>,
     opts: &EmbedOptions,
+    cancel: &CancellationToken,
 ) -> Result<(Vec<EmbeddingVector>, usize), EmbeddingError> {
     let mut slots: Vec<Option<EmbeddingVector>> = (0..items.len()).map(|_| None).collect();
     let mut prompt_tokens = 0usize;
@@ -163,7 +167,7 @@ fn embed_items(
                 _ => None,
             })
             .collect();
-        let reply = provider.embed_texts(texts, opts.clone())?;
+        let reply = provider.embed_texts(texts, opts.clone(), cancel.clone())?;
         prompt_tokens += reply.prompt_tokens;
         for (&i, vector) in text_indices.iter().zip(reply.vectors) {
             slots[i] = Some(vector);
@@ -183,7 +187,7 @@ fn embed_items(
                 _ => None,
             })
             .collect();
-        let reply = provider.embed_tokens(rows, opts.clone())?;
+        let reply = provider.embed_tokens(rows, opts.clone(), cancel.clone())?;
         prompt_tokens += reply.prompt_tokens;
         for (&i, vector) in token_indices.iter().zip(reply.vectors) {
             slots[i] = Some(vector);
@@ -191,7 +195,7 @@ fn embed_items(
     }
 
     for (index, image) in images {
-        let reply = provider.embed_image(image, opts.clone())?;
+        let reply = provider.embed_image(image, opts.clone(), cancel.clone())?;
         prompt_tokens += reply.prompt_tokens;
         if let Some(vector) = reply.vectors.into_iter().next() {
             slots[index] = Some(vector);
@@ -324,10 +328,14 @@ async fn embeddings_impl(state: AppState, body: Value, shape: EmbeddingShape) ->
     };
     let started = std::time::Instant::now();
     // The provider blocks on the worker's reply channel, so keep it off the
-    // async executor.
+    // async executor. Dropping this future does not stop a `spawn_blocking`
+    // closure, so the drop guard cancels the token to tell the worker that the
+    // client is gone.
+    let cancel = CancellationToken::new();
+    let _cancel_on_drop = cancel.clone().drop_guard();
     let worker_provider: Arc<dyn EmbeddingModelProvider> = provider.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        embed_items(worker_provider.as_ref(), &items, images, &opts)
+        embed_items(worker_provider.as_ref(), &items, images, &opts, &cancel)
     })
     .await;
     let (vectors, prompt_tokens) = match outcome {
