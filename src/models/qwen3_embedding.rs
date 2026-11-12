@@ -18,11 +18,10 @@
 //! an ordinary `Qwen3ForCausalLM` (`model_type: qwen3`) with a
 //! sentence-transformers `1_Pooling` module declaring
 //! `pooling_mode_lasttoken: true`, and the sentence embedding is the hidden
-//! state at the `<|endoftext|>` token the tokenizer appends. Because the last
-//! real token attends every earlier token, causal attention over a
-//! right-padded batch produces the single-row result for every real position:
-//! padding sits after the real tokens, so no real query ever sees a padding
-//! key. The forward pass therefore passes no mask array and relies on the
+//! state at the `<|endoftext|>` token the tokenizer appends. Under causal
+//! attention the padding of a right-padded batch does not change a real
+//! position: padding sits after the real tokens, so no real query ever sees a
+//! padding key. The forward pass therefore passes no mask array and relies on the
 //! batch being right-padded; the outputs at padding positions are never
 //! pooled.
 //!
