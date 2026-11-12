@@ -40,11 +40,12 @@
 //!   run is visible to all of them.
 //!
 //! A request with one document has nothing to share, so its row is forwarded
-//! whole, and two details make that read correct:
+//! whole and unpadded. Several rows are forwarded whole only when they share
+//! no run, and two details make the read of those rows correct:
 //!
-//! - rows forwarded whole are **left**-padded, which is what puts every row's
-//!   last real token at column `L - 1`. Right padding would read the score off
-//!   a pad token for every row but the longest;
+//! - the rows are **left**-padded, which is what puts every row's last real
+//!   token at column `L - 1`. Right padding would read the score off a pad
+//!   token for every row but the longest;
 //! - the mask is [`create_causal_padding_mask`], so the pad prefix is blocked
 //!   as a key everywhere and the leading padding rows keep a finite softmax.
 //!
@@ -437,18 +438,34 @@ impl Qwen3Reranker {
         ))
     }
 
-    /// Score a request's encoded prompt rows from the run they share, the
-    /// step [`Reranker::score_until`] takes once the rows are encoded.
+    /// Score a request: encode one prompt row per document and score the rows
+    /// from the run they share. [`Reranker::score_until`] is this step alone.
     ///
     /// Returns what [`Self::score_encoded`] returns, then the shared-run
     /// length this step chose, `0` when the rows were forwarded whole.
     fn score_request(
         &self,
-        rows: &[EncodedRow],
+        query: &RerankItem,
+        documents: &[RerankItem],
+        instruction: Option<&str>,
         is_abandoned: &dyn Fn() -> bool,
     ) -> Result<(RerankScores, usize, usize)> {
-        let shared_len = shared_run_len(rows);
-        let (scores, forwarded) = self.score_encoded(rows, shared_len, is_abandoned)?;
+        if query.has_image() || documents.iter().any(RerankItem::has_image) {
+            bail!("the Qwen3 reranker is text-only; use a Qwen3-VL reranker for image documents");
+        }
+        let instruction = resolve_instruction(instruction);
+        let query_text = query.text_or_empty();
+        let rows = documents
+            .iter()
+            .map(|document| {
+                Ok(EncodedRow {
+                    ids: self.encode_row(instruction, query_text, document.text_or_empty())?,
+                    type_ids: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let shared_len = shared_run_len(&rows);
+        let (scores, forwarded) = self.score_encoded(&rows, shared_len, is_abandoned)?;
         Ok((scores, forwarded, shared_len))
     }
 }
@@ -536,21 +553,7 @@ impl Reranker for Qwen3Reranker {
         instruction: Option<&str>,
         is_abandoned: &dyn Fn() -> bool,
     ) -> Result<RerankScores> {
-        if query.has_image() || documents.iter().any(RerankItem::has_image) {
-            bail!("the Qwen3 reranker is text-only; use a Qwen3-VL reranker for image documents");
-        }
-        let instruction = resolve_instruction(instruction);
-        let query_text = query.text_or_empty();
-        let rows = documents
-            .iter()
-            .map(|document| {
-                Ok(EncodedRow {
-                    ids: self.encode_row(instruction, query_text, document.text_or_empty())?,
-                    type_ids: None,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let (scores, _, _) = self.score_request(&rows, is_abandoned)?;
+        let (scores, _, _) = self.score_request(query, documents, instruction, is_abandoned)?;
         Ok(scores)
     }
 

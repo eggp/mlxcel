@@ -763,7 +763,12 @@ fn shared_run_scores_match_whole_rows_and_forward_the_run_once() {
         "the shared-run path must compute fewer positions for the request's path to show"
     );
     let (requested, requested_forwarded, requested_shared) = reranker
-        .score_request(&rows, &|| false)
+        .score_request(
+            &RerankItem::text("what is panda?"),
+            &documents,
+            None,
+            &|| false,
+        )
         .expect("the request scores");
     assert_eq!(
         requested_forwarded, tails_forwarded,
@@ -851,7 +856,12 @@ fn single_document_request_forwards_its_whole_row() {
     // One row has no padding on either path and computes as many positions,
     // so only the chosen run length shows which path the request took.
     let (scored, forwarded, shared) = reranker
-        .score_request(&rows, &|| false)
+        .score_request(
+            &RerankItem::text("what is panda?"),
+            &documents,
+            None,
+            &|| false,
+        )
         .expect("a single document scores");
     assert_eq!(shared, 0, "a single document must be forwarded whole");
     assert_eq!(forwarded, rows[0].ids.len());
