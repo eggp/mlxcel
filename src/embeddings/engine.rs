@@ -77,6 +77,10 @@ pub enum EmbeddingEngineError {
     /// The forward pass or a post-processing step failed.
     #[error("{0}")]
     Internal(String),
+    /// An `*_until` call stopped at a micro-batch boundary because its caller
+    /// no longer waits.
+    #[error("embedding request abandoned")]
+    Abandoned,
 }
 
 /// Per-request options forwarded to the engine.
@@ -258,6 +262,17 @@ impl EmbeddingEngine {
         texts: &[String],
         options: &EmbedOptions,
     ) -> Result<EmbedReply, EmbeddingEngineError> {
+        self.embed_texts_until(texts, options, &|| false)
+    }
+
+    /// [`Self::embed_texts`], stopping at the next micro-batch boundary once
+    /// `is_abandoned()` returns `true`, with [`EmbeddingEngineError::Abandoned`].
+    pub fn embed_texts_until(
+        &self,
+        texts: &[String],
+        options: &EmbedOptions,
+        is_abandoned: &dyn Fn() -> bool,
+    ) -> Result<EmbedReply, EmbeddingEngineError> {
         self.validate_dimensions(options.dimensions)?;
         let encode = EncodeOptions {
             add_special_tokens: true,
@@ -279,7 +294,7 @@ impl EmbeddingEngine {
                 .map_err(|e| EmbeddingEngineError::Internal(e.to_string()))?;
             rows.push(row);
         }
-        self.run_rows(rows, None, self.post_options(options))
+        self.run_rows(rows, None, self.post_options(options), is_abandoned)
     }
 
     /// Embed verbatim token-id rows (no special tokens added).
@@ -287,6 +302,17 @@ impl EmbeddingEngine {
         &self,
         token_rows: &[Vec<u32>],
         options: &EmbedOptions,
+    ) -> Result<EmbedReply, EmbeddingEngineError> {
+        self.embed_tokens_until(token_rows, options, &|| false)
+    }
+
+    /// [`Self::embed_tokens`], stopping at the next micro-batch boundary once
+    /// `is_abandoned()` returns `true`, with [`EmbeddingEngineError::Abandoned`].
+    pub fn embed_tokens_until(
+        &self,
+        token_rows: &[Vec<u32>],
+        options: &EmbedOptions,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<EmbedReply, EmbeddingEngineError> {
         self.validate_dimensions(options.dimensions)?;
         let vocab_size = self.vocab_size();
@@ -309,7 +335,7 @@ impl EmbeddingEngine {
             let type_ids = needs_type_ids.then(|| vec![0; ids.len()]);
             rows.push(EncodedRow { ids, type_ids });
         }
-        self.run_rows(rows, None, self.post_options(options))
+        self.run_rows(rows, None, self.post_options(options), is_abandoned)
     }
 
     /// Embed one image (VLM embedders only). The text side of the batch is
@@ -354,16 +380,23 @@ impl EmbeddingEngine {
             type_ids: row.type_ids.map(|_| vec![0; ids.len()]),
             ids,
         };
-        self.run_rows(vec![row], Some(&images), self.post_options(options))
+        self.run_rows(
+            vec![row],
+            Some(&images),
+            self.post_options(options),
+            &|| false,
+        )
     }
 
     /// Sort rows by length, cut them into micro-batches, run each, and write
-    /// the results back in the caller's order.
+    /// the results back in the caller's order. Before each micro-batch,
+    /// `is_abandoned()` decides whether the call stops instead.
     fn run_rows(
         &self,
         rows: Vec<EncodedRow>,
         images: Option<&[ImageInput]>,
         post: PostOptions,
+        is_abandoned: &dyn Fn() -> bool,
     ) -> Result<EmbedReply, EmbeddingEngineError> {
         let prompt_tokens: usize = rows.iter().map(|r| r.ids.len()).sum();
         let mut order: Vec<usize> = (0..rows.len()).collect();
@@ -377,6 +410,9 @@ impl EmbeddingEngine {
 
         let mut vectors: Vec<Option<EmbeddingVector>> = (0..rows.len()).map(|_| None).collect();
         for range in micro_batch_bounds(&padded_lengths, self.batch_size, self.token_budget) {
+            if is_abandoned() {
+                return Err(EmbeddingEngineError::Abandoned);
+            }
             let chunk = &order[range];
             let chunk_rows: Vec<EncodedRow> = chunk.iter().map(|&i| rows[i].clone()).collect();
             let batch = EncodedBatch::from_rows(&chunk_rows, self.loaded.pad_token_id, pad_to);

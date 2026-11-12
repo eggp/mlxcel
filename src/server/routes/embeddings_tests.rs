@@ -57,6 +57,7 @@ impl EmbeddingModelProvider for NonFiniteEmbeddingProvider {
         &self,
         _texts: Vec<String>,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
@@ -65,6 +66,7 @@ impl EmbeddingModelProvider for NonFiniteEmbeddingProvider {
         &self,
         _token_rows: Vec<Vec<u32>>,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
@@ -73,6 +75,7 @@ impl EmbeddingModelProvider for NonFiniteEmbeddingProvider {
         &self,
         _image: ImageInput,
         _opts: EmbedOptions,
+        _cancel: tokio_util::sync::CancellationToken,
     ) -> Result<EmbedReply, EmbeddingError> {
         Ok(Self::reply())
     }
@@ -432,12 +435,118 @@ fn error_mapping_matches_audio_routes() {
     let timeout = embedding_error_response(EmbeddingError::Timeout);
     assert_eq!(timeout.status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(timeout.error.error_type, "server_timeout");
+    let cancelled = embedding_error_response(EmbeddingError::Cancelled);
+    assert_eq!(cancelled.status.as_u16(), 499);
+    assert_eq!(cancelled.error.error_type, "client_closed_request");
     let invalid = embedding_error_response(EmbeddingError::InvalidInput("bad".into()));
     assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
     assert_eq!(invalid.error.error_type, "invalid_request_error");
     let internal = embedding_error_response(EmbeddingError::Internal("boom".into()));
     assert_eq!(internal.status, StatusCode::INTERNAL_SERVER_ERROR);
     assert!(internal.error.message.contains("boom"));
+}
+
+#[tokio::test]
+async fn dropped_http_request_cancels_in_flight_worker_at_next_micro_batch() {
+    use crate::embeddings::{EmbeddingBatch, EmbeddingModel, EmbeddingOutput};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Bounds every blocking receive, so a regression fails instead of hanging.
+    const GATE_WAIT: Duration = Duration::from_secs(10);
+
+    struct GatedBatchModel {
+        batches: Arc<AtomicUsize>,
+        entered: mpsc::Sender<usize>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl EmbeddingModel for GatedBatchModel {
+        fn embed(&self, batch: &EmbeddingBatch) -> anyhow::Result<EmbeddingOutput> {
+            let index = self.batches.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered.send(index);
+            let _ = self.release.recv_timeout(GATE_WAIT);
+            let b = mlxcel_core::array_shape(batch.input_ids)[0];
+            Ok(EmbeddingOutput {
+                embeddings: mlxcel_core::ones(&[b, STUB_DIM as i32], mlxcel_core::dtype::FLOAT32),
+                last_hidden_state: None,
+            })
+        }
+
+        fn default_pooling(&self) -> crate::embeddings::PoolingMode {
+            crate::embeddings::PoolingMode::Mean
+        }
+
+        fn embedding_dim(&self) -> usize {
+            STUB_DIM
+        }
+    }
+
+    let (entered_tx, entered_rx) = mpsc::channel::<usize>();
+    let (release_tx, release_rx) = mpsc::channel::<()>();
+    let batches = Arc::new(AtomicUsize::new(0));
+    let batches_clone = Arc::clone(&batches);
+
+    // Micro-batches of 2 token rows.
+    let provider: Arc<dyn EmbeddingModelProvider> = Arc::new(
+        EmbeddingWorkerProvider::from_loader(
+            STUB_MODEL_ID.to_string(),
+            2,
+            crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
+            8,
+            Duration::from_secs(30),
+            move || {
+                let mut loaded = stub_loaded_model(false);
+                loaded.model = Box::new(GatedBatchModel {
+                    batches: batches_clone,
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+                Ok(loaded)
+            },
+        )
+        .expect("worker spawns"),
+    );
+
+    let app = app_with(Some(provider));
+
+    // Start a 6-row request (3 micro-batches) and drop the HTTP future while
+    // micro-batch 0 is in flight.
+    let mut dropped_fut = Box::pin(
+        app.clone().oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/v1/embeddings")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"input": [[3], [4], [5], [6], [7], [8]]}).to_string(),
+                ))
+                .expect("request builds"),
+        ),
+    );
+
+    tokio::select! {
+        _ = &mut dropped_fut => panic!("request must block on micro-batch 0"),
+        index = tokio::task::spawn_blocking(move || {
+            entered_rx.recv_timeout(GATE_WAIT).expect("entered micro-batch 0")
+        }) => {
+            assert_eq!(index.expect("join"), 0);
+        }
+    }
+
+    // A client that disconnects drops the handler future.
+    drop(dropped_fut);
+    // Close the gate so micro-batch 0 finishes and later ones do not block.
+    drop(release_tx);
+
+    let (status, body) = post(app, "/v1/embeddings", json!({"input": [[3], [4]]})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().map(Vec::len), Some(2), "{body}");
+
+    assert_eq!(
+        batches.load(Ordering::SeqCst),
+        2,
+        "the dropped request stops after micro-batch 0, plus 1 micro-batch for the live request"
+    );
 }
 
 #[test]

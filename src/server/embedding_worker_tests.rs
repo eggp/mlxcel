@@ -17,10 +17,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
 
-use super::{EmbeddingCommand, EmbeddingWorker, EmbeddingWorkerProvider, Reply};
+use tokio_util::sync::CancellationToken;
+
+use super::{EmbeddingCommand, EmbeddingWork, EmbeddingWorker, EmbeddingWorkerProvider, Reply};
 use crate::embeddings::stub::{STUB_DIM, STUB_MAX_LENGTH, STUB_VOCAB_SIZE, stub_loaded_model};
 use crate::embeddings::{
-    EmbedOptions, EmbeddingBatch, EmbeddingModel, EmbeddingOutput, LoadedEmbeddingModel,
+    EmbedOptions, EmbedReply, EmbeddingBatch, EmbeddingEngine, EmbeddingModel, EmbeddingOutput,
+    LoadedEmbeddingModel,
 };
 use crate::server::embedding_model::{EmbeddingError, EmbeddingModelProvider};
 
@@ -71,6 +74,7 @@ fn worker_round_trips_texts_and_tokens_on_its_own_thread() {
         .embed_texts(
             vec!["hello world".to_string(), "hello".to_string()],
             EmbedOptions::default(),
+            CancellationToken::new(),
         )
         .expect("texts embed");
     assert_eq!(reply.vectors.len(), 2);
@@ -85,7 +89,11 @@ fn worker_round_trips_texts_and_tokens_on_its_own_thread() {
     assert!(dot > 0.5, "texts sharing `hello` are similar: {dot}");
 
     let reply = p
-        .embed_tokens(vec![vec![3, 4], vec![5]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![3, 4], vec![5]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect("tokens embed");
     assert_eq!(reply.prompt_tokens, 3);
     assert_eq!(reply.vectors[1].shape, vec![STUB_DIM]);
@@ -95,11 +103,19 @@ fn worker_round_trips_texts_and_tokens_on_its_own_thread() {
 fn worker_maps_engine_invalid_input() {
     let p = provider();
     let err = p
-        .embed_tokens(vec![vec![STUB_VOCAB_SIZE as u32]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![STUB_VOCAB_SIZE as u32]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("out-of-vocab id is rejected");
     assert!(matches!(err, EmbeddingError::InvalidInput(_)), "{err:?}");
     let err = p
-        .embed_texts(vec![String::new()], EmbedOptions::default())
+        .embed_texts(
+            vec![String::new()],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("empty text is rejected");
     assert!(matches!(err, EmbeddingError::InvalidInput(_)), "{err:?}");
 }
@@ -163,7 +179,11 @@ fn worker_survives_a_panicking_request_and_keeps_serving() {
     .expect("worker spawns");
 
     let err = p
-        .embed_tokens(vec![vec![7]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![7]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("the sentinel id panics inside the engine");
     match err {
         EmbeddingError::Internal(message) => {
@@ -174,7 +194,11 @@ fn worker_survives_a_panicking_request_and_keeps_serving() {
     }
 
     let reply = p
-        .embed_tokens(vec![vec![3]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![3]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect("the worker still serves after the panic");
     assert_eq!(reply.vectors.len(), 1);
 }
@@ -213,7 +237,11 @@ fn request_timeout_returns_timeout_error() {
     )
     .expect("worker spawns");
     let err = p
-        .embed_tokens(vec![vec![3]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![3]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("slower than the timeout");
     assert!(matches!(err, EmbeddingError::Timeout), "{err:?}");
 }
@@ -266,13 +294,21 @@ fn queue_full_returns_queuefull_error() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            let _ = worker.embed_tokens(vec![vec![3]], EmbedOptions::default());
+            let _ = worker.embed_tokens(
+                vec![vec![3]],
+                EmbedOptions::default(),
+                CancellationToken::new(),
+            );
         });
         started_rx.recv().expect("in-flight request started");
 
         let mut saw_queue_full = false;
         for _ in 0..(queue_depth + 1) {
-            match worker.embed_tokens(vec![vec![3]], EmbedOptions::default()) {
+            match worker.embed_tokens(
+                vec![vec![3]],
+                EmbedOptions::default(),
+                CancellationToken::new(),
+            ) {
                 Err(EmbeddingError::QueueFull) => {
                     saw_queue_full = true;
                     break;
@@ -324,12 +360,16 @@ fn each_request_releases_the_cache_once() {
     // request, not per micro-batch (the batch size here is 4).
     let texts: Vec<String> = (0..9).map(|i| format!("text {i}")).collect();
     worker
-        .embed_texts(texts, EmbedOptions::default())
+        .embed_texts(texts, EmbedOptions::default(), CancellationToken::new())
         .expect("texts embed");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 
     worker
-        .embed_tokens(vec![vec![3, 4], vec![5]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![3, 4], vec![5]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect("tokens embed");
     assert_eq!(clears.load(Ordering::SeqCst), 2);
 }
@@ -338,7 +378,11 @@ fn each_request_releases_the_cache_once() {
 fn a_failed_request_still_releases_the_cache() {
     let (worker, clears) = counting_worker(|| Ok(stub_loaded_model(false)));
     worker
-        .embed_tokens(vec![vec![STUB_VOCAB_SIZE as u32]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![STUB_VOCAB_SIZE as u32]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("out-of-vocab id is rejected");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 
@@ -346,7 +390,7 @@ fn a_failed_request_still_releases_the_cache() {
         image: image::DynamicImage::new_rgb8(4, 4),
     };
     worker
-        .embed_image(image, EmbedOptions::default())
+        .embed_image(image, EmbedOptions::default(), CancellationToken::new())
         .expect_err("the text-only stub rejects images");
     assert_eq!(clears.load(Ordering::SeqCst), 2);
 }
@@ -355,12 +399,16 @@ fn a_failed_request_still_releases_the_cache() {
 fn a_panicking_request_still_releases_the_cache() {
     let (worker, clears) = counting_worker(|| Ok(panicking_loaded_model()));
     worker
-        .embed_tokens(vec![vec![7]], EmbedOptions::default())
+        .embed_tokens(
+            vec![vec![7]],
+            EmbedOptions::default(),
+            CancellationToken::new(),
+        )
         .expect_err("the sentinel id panics inside the engine");
     assert_eq!(clears.load(Ordering::SeqCst), 1);
 }
 
-/// Bounds every blocking receive of the gated test, so a regression fails
+/// Bounds every blocking receive of the gated tests, so a regression fails
 /// instead of hanging.
 const WAIT: Duration = Duration::from_secs(10);
 
@@ -393,30 +441,30 @@ impl EmbeddingModel for ForwardCountingModel {
     }
 }
 
-fn nine_texts(respond: Reply) -> EmbeddingCommand {
-    EmbeddingCommand::Texts {
-        texts: vec!["hello".to_string(); 9],
+fn embed_command(work: EmbeddingWork, respond: Reply) -> EmbeddingCommand {
+    EmbeddingCommand::Embed {
+        work,
         opts: EmbedOptions::default(),
+        cancel: CancellationToken::new(),
         respond,
     }
+}
+
+fn nine_texts(respond: Reply) -> EmbeddingCommand {
+    embed_command(EmbeddingWork::Texts(vec!["hello".to_string(); 9]), respond)
 }
 
 fn two_token_rows(respond: Reply) -> EmbeddingCommand {
-    EmbeddingCommand::Tokens {
-        rows: vec![vec![3, 4], vec![5]],
-        opts: EmbedOptions::default(),
-        respond,
-    }
+    embed_command(EmbeddingWork::Tokens(vec![vec![3, 4], vec![5]]), respond)
 }
 
 fn one_image(respond: Reply) -> EmbeddingCommand {
-    EmbeddingCommand::Image {
-        image: Box::new(crate::embeddings::ImageInput {
+    embed_command(
+        EmbeddingWork::Image(Box::new(crate::embeddings::ImageInput {
             image: image::DynamicImage::new_rgb8(4, 4),
-        }),
-        opts: EmbedOptions::default(),
+        })),
         respond,
-    }
+    )
 }
 
 #[test]
@@ -488,4 +536,264 @@ fn each_request_kind_releases_the_cache_once_before_its_reply() {
     // Dropping the worker joins its thread, so the count is final.
     drop(worker);
     assert_eq!(clears.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn request_that_is_not_abandoned_returns_the_engine_result() {
+    // Micro-batches of 2 over 5 rows of different lengths: 3 forward passes,
+    // run in length order and written back in the caller's order.
+    let p = EmbeddingWorkerProvider::from_loader(
+        "stub-embed".to_string(),
+        2,
+        crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
+        8,
+        Duration::from_secs(30),
+        || Ok(stub_loaded_model(false)),
+    )
+    .expect("stub worker spawns");
+    let engine = EmbeddingEngine::new(stub_loaded_model(false), 2);
+    let opts = EmbedOptions::default();
+
+    let rows = vec![
+        vec![3, 4, 5],
+        vec![6],
+        vec![7, 8],
+        vec![3],
+        vec![9, 10, 11, 12],
+    ];
+    let expected = engine.embed_tokens(&rows, &opts).expect("engine embeds");
+    let reply = p
+        .embed_tokens(rows, opts.clone(), CancellationToken::new())
+        .expect("worker embeds");
+    assert_eq!(reply, expected);
+
+    let texts: Vec<String> = ["hello world", "world", "hello", "world hello world"]
+        .iter()
+        .map(|t| t.to_string())
+        .collect();
+    let expected = engine.embed_texts(&texts, &opts).expect("engine embeds");
+    let reply = p
+        .embed_texts(texts, opts, CancellationToken::new())
+        .expect("worker embeds");
+    assert_eq!(reply, expected);
+}
+
+const GATED_BATCH_SIZE: usize = 2;
+
+/// A fake model that counts the micro-batches it runs and holds each one at a
+/// gate: it reports the batch's running index, then waits until the test
+/// releases the batch or drops the release sender.
+struct GatedBatchModel {
+    batches_run: Arc<AtomicUsize>,
+    batch_entered: mpsc::Sender<usize>,
+    batch_release: mpsc::Receiver<()>,
+}
+
+impl EmbeddingModel for GatedBatchModel {
+    fn embed(&self, batch: &EmbeddingBatch) -> anyhow::Result<EmbeddingOutput> {
+        let index = self.batches_run.fetch_add(1, Ordering::SeqCst);
+        let _ = self.batch_entered.send(index);
+        let _ = self.batch_release.recv_timeout(WAIT);
+        let b = mlxcel_core::array_shape(batch.input_ids)[0];
+        Ok(EmbeddingOutput {
+            embeddings: mlxcel_core::ones(&[b, STUB_DIM as i32], mlxcel_core::dtype::FLOAT32),
+            last_hidden_state: None,
+        })
+    }
+
+    fn default_pooling(&self) -> crate::embeddings::PoolingMode {
+        crate::embeddings::PoolingMode::Mean
+    }
+
+    fn embedding_dim(&self) -> usize {
+        STUB_DIM
+    }
+}
+
+/// A worker over [`GatedBatchModel`] with the test's ends of its channels.
+/// `batch_release` is declared first so it drops before the worker joins its
+/// thread, which may be waiting at the gate.
+struct GatedWorker {
+    batch_release: mpsc::Sender<()>,
+    batch_entered: mpsc::Receiver<usize>,
+    worker: EmbeddingWorker,
+    batches_run: Arc<AtomicUsize>,
+    clears: Arc<AtomicUsize>,
+}
+
+fn gated_worker(request_timeout: Duration) -> GatedWorker {
+    let (entered_tx, batch_entered) = mpsc::channel();
+    let (batch_release, release_rx) = mpsc::channel();
+    let batches_run = Arc::new(AtomicUsize::new(0));
+    let batches = Arc::clone(&batches_run);
+    let clears = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&clears);
+    let worker = EmbeddingWorker::spawn_with_cache_clear(
+        "embed-test-gated",
+        8,
+        request_timeout,
+        GATED_BATCH_SIZE,
+        crate::embeddings::DEFAULT_EMBEDDING_TOKEN_BUDGET,
+        move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        },
+        move || {
+            let mut loaded = stub_loaded_model(false);
+            loaded.model = Box::new(GatedBatchModel {
+                batches_run: batches,
+                batch_entered: entered_tx,
+                batch_release: release_rx,
+            });
+            Ok(loaded)
+        },
+    )
+    .expect("worker spawns");
+    GatedWorker {
+        batch_release,
+        batch_entered,
+        worker,
+        batches_run,
+        clears,
+    }
+}
+
+/// `count` single-token rows, so `count / GATED_BATCH_SIZE` micro-batches.
+fn token_rows(count: u32) -> Vec<Vec<u32>> {
+    (0..count).map(|i| vec![3 + i]).collect()
+}
+
+#[test]
+fn queued_request_whose_caller_is_gone_runs_zero_micro_batches() {
+    let gated = gated_worker(Duration::from_secs(30));
+    let worker = &gated.worker;
+    let release = gated.batch_release;
+
+    std::thread::scope(|scope| {
+        // The first request holds the worker at the gate of its only batch.
+        let first = scope.spawn(|| {
+            worker.embed_tokens(
+                token_rows(1),
+                EmbedOptions::default(),
+                CancellationToken::new(),
+            )
+        });
+        assert_eq!(gated.batch_entered.recv_timeout(WAIT), Ok(0));
+
+        // The second request (2 micro-batches) is cancelled before the worker
+        // can dequeue it. It is enqueued either behind the held first request
+        // or after it; the worker reaches it cancelled in both orders.
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let second =
+            scope.spawn(|| worker.embed_tokens(token_rows(4), EmbedOptions::default(), cancel));
+
+        release.send(()).expect("the worker waits at the gate");
+        first
+            .join()
+            .expect("first caller joins")
+            .expect("the request whose caller waits is run");
+        // A wrongly run second request must not wait at the gate.
+        drop(release);
+        let err = second
+            .join()
+            .expect("second caller joins")
+            .expect_err("the cancelled request is skipped");
+        assert!(matches!(err, EmbeddingError::Cancelled), "{err:?}");
+    });
+
+    assert_eq!(
+        gated.batches_run.load(Ordering::SeqCst),
+        1,
+        "only the first request's micro-batch runs"
+    );
+    // The skipped request allocated no MLX buffers, so it releases no cache.
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 1);
+}
+
+/// A request of `count` items of one input kind, each item one micro-batch
+/// slot, so `count / GATED_BATCH_SIZE` micro-batches.
+type GatedRequest =
+    fn(&EmbeddingWorker, u32, CancellationToken) -> Result<EmbedReply, EmbeddingError>;
+
+fn token_request(
+    worker: &EmbeddingWorker,
+    count: u32,
+    cancel: CancellationToken,
+) -> Result<EmbedReply, EmbeddingError> {
+    worker.embed_tokens(token_rows(count), EmbedOptions::default(), cancel)
+}
+
+fn text_request(
+    worker: &EmbeddingWorker,
+    count: u32,
+    cancel: CancellationToken,
+) -> Result<EmbedReply, EmbeddingError> {
+    let texts = vec!["hello".to_string(); count as usize];
+    worker.embed_texts(texts, EmbedOptions::default(), cancel)
+}
+
+#[test]
+fn in_flight_request_stops_at_next_micro_batch_boundary_and_serves_next() {
+    in_flight_request_stops_and_the_next_is_served(token_request);
+}
+
+#[test]
+fn in_flight_text_request_stops_at_next_micro_batch_boundary_and_serves_next() {
+    in_flight_request_stops_and_the_next_is_served(text_request);
+}
+
+fn in_flight_request_stops_and_the_next_is_served(request: GatedRequest) {
+    let gated = gated_worker(Duration::from_secs(30));
+    let worker = &gated.worker;
+    let release = gated.batch_release;
+    let cancel = CancellationToken::new();
+
+    std::thread::scope(|scope| {
+        // 6 items are 3 micro-batches.
+        let caller_cancel = cancel.clone();
+        let stopped = scope.spawn(|| request(worker, 6, caller_cancel));
+        assert_eq!(gated.batch_entered.recv_timeout(WAIT), Ok(0));
+
+        // Batch 0 is held at the gate, so the cancellation lands inside it;
+        // the release then lets batch 0 finish and reach the boundary check.
+        cancel.cancel();
+        release.send(()).expect("the worker waits at the gate");
+        let err = stopped
+            .join()
+            .expect("caller joins")
+            .expect_err("the request stops before batch 1");
+        assert!(matches!(err, EmbeddingError::Cancelled), "{err:?}");
+    });
+    assert_eq!(
+        gated.batches_run.load(Ordering::SeqCst),
+        1,
+        "batches 1 and 2 of the stopped request do not run"
+    );
+    // The stopped request ran a micro-batch, so it releases the cache once.
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 1);
+
+    // With the release sender gone the gate holds no batch, so the next
+    // request (2 micro-batches) runs straight through.
+    drop(release);
+    let live = request(worker, 4, CancellationToken::new())
+        .expect("the worker serves the next request after a stopped one");
+    assert_eq!(live.vectors.len(), 4);
+    assert_eq!(gated.batches_run.load(Ordering::SeqCst), 3);
+    assert_eq!(gated.clears.load(Ordering::SeqCst), 2);
+}
+
+#[test]
+fn reply_timeout_cancels_the_request_token() {
+    let gated = gated_worker(Duration::from_millis(50));
+    let cancel = CancellationToken::new();
+
+    // The gate is not released while the caller waits, so no reply can arrive
+    // and the timeout is the only outcome, however late the worker dequeues
+    // the request.
+    let err = gated
+        .worker
+        .embed_tokens(token_rows(1), EmbedOptions::default(), cancel.clone())
+        .expect_err("no reply while the gate holds the batch");
+    assert!(matches!(err, EmbeddingError::Timeout), "{err:?}");
+    assert!(cancel.is_cancelled());
 }
