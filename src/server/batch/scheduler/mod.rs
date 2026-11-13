@@ -41,6 +41,7 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
+use mlxcel_core::prefill_plan::{MAX_SPLITS, PrefillSplits};
 use mlxcel_core::sampling::{FusedSampleParams, TokenBiasMap};
 use mlxcel_core::sampling_row_step::{LogitMask, RowSampler};
 use mlxcel_core::sampling_token_bias::compose_token_bias;
@@ -256,6 +257,69 @@ pub(crate) fn history_boundary_len(
         return None;
     }
     Some(boundary)
+}
+
+/// Decide the system-prompt root for a request (#2885 Part B).
+///
+/// `root` is the tokenized root render, `prompt_tokens` what the model will
+/// prefill, `history_boundary` the already resolved history boundary. The root
+/// is their longest common prefix minus its last token: the render ends at the
+/// first user turn's header, and the token there can merge with the first
+/// characters of the user's text, so dropping it keeps the length identical
+/// across chats that share the system prompt. Rejected when the prompt is
+/// shorter than `min_prompt_tokens` (the opt-in threshold), when the root is
+/// below the store's `min_prefix_tokens`, or when it does not end strictly
+/// before the history boundary (or the prompt end).
+///
+/// Used by: `BatchScheduler::resolve_history_boundary`
+pub(crate) fn system_root_len(
+    root: &[i32],
+    prompt_tokens: &[i32],
+    history_boundary: Option<usize>,
+    min_prefix_tokens: usize,
+    min_prompt_tokens: usize,
+) -> Option<usize> {
+    if prompt_tokens.len() < min_prompt_tokens {
+        return None;
+    }
+    let len = common_prefix_len(root, prompt_tokens)
+        .min(root.len())
+        .checked_sub(1)?;
+    let upper = history_boundary.unwrap_or(prompt_tokens.len());
+    (len > 0 && len >= min_prefix_tokens && len < upper).then_some(len)
+}
+
+/// The periodic checkpoint positions of a prefill (#2885 Part B): every
+/// multiple of `interval` strictly after `start` (the adopted prefix) and
+/// strictly before `upper` (the history boundary, or the prompt end when there
+/// is none), at or above the store's `min_prefix_tokens`.
+///
+/// The points are absolute multiples, so they depend only on the prompt
+/// prefix: two prompts that share the first `k * interval` tokens both split
+/// at `k * interval`. At most `max` points are returned, the deepest ones,
+/// so a very long prompt keeps the checkpoints closest to its history
+/// boundary and leaves the plan room for the root and the boundary.
+///
+/// Used by: `BatchScheduler::checkpoint_splits`
+pub(crate) fn checkpoint_points(
+    interval: usize,
+    start: usize,
+    upper: usize,
+    min_prefix_tokens: usize,
+    max: usize,
+) -> Vec<usize> {
+    if interval == 0 || max == 0 {
+        return Vec::new();
+    }
+    let first = (start / interval + 1) * interval;
+    let mut points: Vec<usize> = (first..upper)
+        .step_by(interval)
+        .filter(|&p| p >= min_prefix_tokens.max(1))
+        .collect();
+    if points.len() > max {
+        points.drain(..points.len() - max);
+    }
+    points
 }
 
 /// Whether a resolved boundary still splits this sequence's prefill at

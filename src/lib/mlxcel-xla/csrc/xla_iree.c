@@ -122,6 +122,27 @@ typedef struct xla_ctx {
   iree_hal_buffer_view_t** weights;  // resident weights, uploaded once
   iree_hal_buffer_view_t* kcache;    // threaded KV (set by prefill, advanced by decode)
   iree_hal_buffer_view_t* vcache;
+  // Persistent single-sequence decode scalars. The decode loop used to allocate
+  // a device-local buffer for each of token/positions/cache_len and a fresh
+  // readback staging buffer every step; each host-visible staging allocation is
+  // a pinned hipHostMalloc/hipHostFree pair, and on gfx1151 the free alone costs
+  // about 120 us, which shows up as GPU idle between the step's input copies
+  // (#3028). These views are allocated once as host-local, device-visible,
+  // host-coherent page-locked memory and mapped for their whole lifetime, so a
+  // step only writes a few bytes in place. `decode_result` is the persistent
+  // device-to-device target of the token readback.
+  // `step_scalars_state`: 0 = not allocated yet, 1 = ready, -1 = unsupported
+  // here, keep the per-step allocation path.
+  int32_t step_scalars_state;
+  int32_t step_position_count;
+  iree_hal_buffer_view_t* step_token;
+  iree_hal_buffer_view_t* step_pos;
+  iree_hal_buffer_view_t* step_len;
+  iree_hal_buffer_view_t* decode_result;
+  iree_hal_buffer_mapping_t step_token_map;
+  iree_hal_buffer_mapping_t step_pos_map;
+  iree_hal_buffer_mapping_t step_len_map;
+  iree_hal_buffer_mapping_t decode_result_map;
   // Batched (continuous-batching) state, used by the ragged decode path
   // (#449 M3 Stage 2b). kcache_b/vcache_b are the rank-5 per-slot KV
   // [B,L,S,nkv,d] the ragged decode threads; a slot is seeded by a single-seq
@@ -130,6 +151,16 @@ typedef struct xla_ctx {
   iree_hal_buffer_view_t* kcache_b;
   iree_hal_buffer_view_t* vcache_b;
   int32_t rg_bsz;
+  // Batch size baked into the resident ragged decode graph, recorded by
+  // `xla_llama_ragged_bind` before the first reset (issue #2923). Zero means
+  // "not bound"; a reset never guesses it.
+  int32_t rg_compiled_b;
+  // One validity byte per slot: set only after BOTH K and V transfers of a
+  // prefill slot store succeed, cleared before the first transfer so a torn
+  // store can never be observed as valid (issue #2923).
+  uint8_t* rg_valid;
+  // Test-only hook: fail the V transfer of the next slot store.
+  int32_t rg_fail_slot_store;
   iree_host_size_t rg_per;
   iree_hal_dim_t rg_dims[4];
 } xla_ctx;
@@ -147,12 +178,91 @@ typedef struct xla_tensor_desc {
 
 // Forward declaration: xla_llama_create's error path frees a partial context.
 void xla_llama_free(xla_ctx* c);
+// Forward declaration: the test-support fallback hook releases the persistent
+// decode scalars before the helper that defines that release appears.
+static void xla_release_step_scalars(xla_ctx* c);
 
 static const iree_hal_buffer_params_t kDeviceLocalParams = {
     .type = IREE_HAL_MEMORY_TYPE_DEVICE_LOCAL,
     .access = IREE_HAL_MEMORY_ACCESS_ALL,
     .usage = IREE_HAL_BUFFER_USAGE_DEFAULT,
 };
+
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+// Instrumentation for the lazy batch-KV allocation path (issue #2923). The
+// shim records any host mirror and host-to-device upload performed while that
+// path is active, so a device test can assert both stay at zero on first admit.
+static uint64_t xla_test_bk_host_bytes = 0;
+static uint64_t xla_test_bk_h2d_bytes = 0;
+static bool xla_test_bk_window = false;
+
+uint64_t xla_test_batch_kv_host_bytes(void) { return xla_test_bk_host_bytes; }
+uint64_t xla_test_batch_kv_h2d_bytes(void) { return xla_test_bk_h2d_bytes; }
+void xla_test_batch_kv_reset_counters(void) {
+  xla_test_bk_host_bytes = 0;
+  xla_test_bk_h2d_bytes = 0;
+}
+
+// Force the V half of the next prefill slot store to fail, and expose the
+// per-slot validity state so a device test can prove a torn store is rejected.
+void xla_test_set_slot_store_failure(xla_ctx* c, int32_t fail) {
+  if (c) c->rg_fail_slot_store = fail ? 1 : 0;
+}
+
+int32_t xla_test_slot_valid(const xla_ctx* c, int32_t slot) {
+  if (!c || !c->rg_valid || slot < 0 || slot >= c->rg_bsz) return -1;
+  return c->rg_valid[slot] ? 1 : 0;
+}
+
+// Instrumentation for the resident-weight upload path (issue #2961). A base
+// context uploads every weight spec exactly once; a capacity bucket shares the
+// base's views and uploads nothing. These counters make both claims assertable
+// from a device test.
+static uint64_t xla_test_weight_upload_calls = 0;
+static uint64_t xla_test_weight_upload_bytes = 0;
+
+uint64_t xla_test_weight_upload_calls_get(void) {
+  return xla_test_weight_upload_calls;
+}
+uint64_t xla_test_weight_upload_bytes_get(void) {
+  return xla_test_weight_upload_bytes;
+}
+void xla_test_weight_upload_reset(void) {
+  xla_test_weight_upload_calls = 0;
+  xla_test_weight_upload_bytes = 0;
+}
+
+// Instrumentation for the per-decode-step staging path (issue #3028). A second
+// decode step must not allocate any input or readback buffer once the
+// persistent scalars exist, so a device test asserts both counters.
+static uint64_t xla_test_decode_scalar_alloc_calls = 0;
+static uint64_t xla_test_decode_d2d_readbacks = 0;
+
+uint64_t xla_test_decode_scalar_alloc_calls_get(void) {
+  return xla_test_decode_scalar_alloc_calls;
+}
+uint64_t xla_test_decode_d2d_readbacks_get(void) {
+  return xla_test_decode_d2d_readbacks;
+}
+int32_t xla_test_decode_step_scalars_state(const xla_ctx* c) {
+  return c ? c->step_scalars_state : -1;
+}
+void xla_test_decode_counters_reset(void) {
+  xla_test_decode_scalar_alloc_calls = 0;
+  xla_test_decode_d2d_readbacks = 0;
+}
+// Force the next step onto the per-step allocation path (and keep it there), so
+// a device test can prove the fallback still decodes identically.
+void xla_test_force_step_scalars_unsupported(xla_ctx* c, int32_t unsupported) {
+  if (!c) return;
+  if (unsupported) {
+    xla_release_step_scalars(c);
+    c->step_scalars_state = -1;
+  } else {
+    c->step_scalars_state = 0;
+  }
+}
+#endif
 
 static int32_t xla_argmax_f32(const float* v, int32_t n) {
   int32_t best = 0;
@@ -191,6 +301,33 @@ static iree_status_t xla_read_token(xla_ctx* c, iree_hal_buffer_view_t* out,
   if (iree_status_is_ok(s)) *out_token = xla_argmax_f32(host, (int32_t)n);
   free(host);
   return s;
+}
+
+// Single-sequence decode readback (#3028). A scalar i32 output is copied
+// device-to-device into the persistent, already-mapped slot instead of paying
+// the host staging allocation and pinned free that `transfer_d2h` performs per
+// call. Any other output shape (the logits-returning vmfbs) and every context
+// without the persistent scalars fall back to `xla_read_token`. Only the decode
+// step uses this; prefill and ragged decode keep the plain readback.
+static iree_status_t xla_read_token_decode(xla_ctx* c,
+                                           iree_hal_buffer_view_t* out,
+                                           int32_t* out_token) {
+  if (c->step_scalars_state != 1 || !c->decode_result) {
+    return xla_read_token(c, out, out_token);
+  }
+  if (iree_hal_buffer_view_element_count(out) != 1 ||
+      iree_hal_buffer_view_element_type(out) != IREE_HAL_ELEMENT_TYPE_INT_32) {
+    return xla_read_token(c, out, out_token);
+  }
+  IREE_RETURN_IF_ERROR(iree_hal_device_transfer_d2d(
+      c->device, iree_hal_buffer_view_buffer(out), 0,
+      iree_hal_buffer_view_buffer(c->decode_result), 0, sizeof(int32_t),
+      IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout()));
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  xla_test_decode_d2d_readbacks++;
+#endif
+  *out_token = *(const int32_t*)c->decode_result_map.contents.data;
+  return iree_ok_status();
 }
 
 // Batched output readback (ragged decode): a [B] i32 buffer is an on-device
@@ -313,10 +450,178 @@ static iree_status_t xla_alloc_bv(xla_ctx* c, iree_host_size_t rank,
                                   iree_hal_element_type_t elt, const void* data,
                                   iree_host_size_t nbytes,
                                   iree_hal_buffer_view_t** out) {
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  if (xla_test_bk_window && data && nbytes > 0) {
+    // Every byte here is one host-resident copy plus one host-to-device
+    // upload; the batch-KV path must report neither (issue #2923).
+    xla_test_bk_host_bytes += (uint64_t)nbytes;
+    xla_test_bk_h2d_bytes += (uint64_t)nbytes;
+  }
+#endif
   return iree_hal_buffer_view_allocate_buffer_copy(
       c->device, c->allocator, rank, shape, elt,
       IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, kDeviceLocalParams,
       iree_make_const_byte_span(data, nbytes), out);
+}
+
+// Host-local, device-visible, host-coherent page-locked scalars. Allocated and
+// mapped once per context; the decode loop writes a few bytes in place instead
+// of paying a pinned hipHostMalloc/hipHostFree pair per step (#3028).
+static const iree_hal_buffer_params_t kStepScalarParams = {
+    .type = IREE_HAL_MEMORY_TYPE_HOST_LOCAL |
+            IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
+            IREE_HAL_MEMORY_TYPE_HOST_COHERENT,
+    .access = IREE_HAL_MEMORY_ACCESS_ALL,
+    .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_MAPPING |
+             IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
+};
+
+// The readback slot is the device's write target and the host's read source, so
+// it uses the cached download heap instead of the write-combined upload heap:
+// a CPU read of write-combined memory bypasses the cache.
+static const iree_hal_buffer_params_t kStepResultParams = {
+    .type = IREE_HAL_MEMORY_TYPE_HOST_LOCAL |
+            IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE |
+            IREE_HAL_MEMORY_TYPE_HOST_COHERENT |
+            IREE_HAL_MEMORY_TYPE_HOST_CACHED,
+    .access = IREE_HAL_MEMORY_ACCESS_ALL,
+    .usage = IREE_HAL_BUFFER_USAGE_DEFAULT | IREE_HAL_BUFFER_USAGE_MAPPING |
+             IREE_HAL_BUFFER_USAGE_MAPPING_PERSISTENT,
+};
+
+static iree_status_t xla_alloc_step_scalar(
+    xla_ctx* c, const iree_hal_buffer_params_t* params,
+    iree_host_size_t rank, const iree_hal_dim_t* shape,
+    iree_host_size_t nbytes, iree_hal_buffer_view_t** out_view,
+    iree_hal_buffer_mapping_t* out_map) {
+  IREE_RETURN_IF_ERROR(iree_hal_buffer_view_allocate_buffer_copy(
+      c->device, c->allocator, rank, shape, IREE_HAL_ELEMENT_TYPE_INT_32,
+      IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR, *params,
+      iree_const_byte_span_empty(), out_view));
+  iree_status_t status = iree_hal_buffer_map_range(
+      iree_hal_buffer_view_buffer(*out_view), IREE_HAL_MAPPING_MODE_PERSISTENT,
+      IREE_HAL_MEMORY_ACCESS_READ | IREE_HAL_MEMORY_ACCESS_WRITE, 0, nbytes,
+      out_map);
+  if (!iree_status_is_ok(status)) {
+    iree_hal_buffer_view_release(*out_view);
+    *out_view = NULL;
+  }
+  return status;
+}
+
+static void xla_release_step_scalars(xla_ctx* c) {
+  iree_hal_buffer_mapping_t* maps[4] = {
+      &c->step_token_map, &c->step_pos_map, &c->step_len_map,
+      &c->decode_result_map};
+  iree_hal_buffer_view_t** views[4] = {
+      &c->step_token, &c->step_pos, &c->step_len, &c->decode_result};
+  for (int i = 0; i < 4; i++) {
+    if (*views[i]) {
+      iree_hal_buffer_unmap_range(maps[i]);
+      iree_hal_buffer_view_release(*views[i]);
+      *views[i] = NULL;
+    }
+  }
+  c->step_scalars_state = 0;
+}
+
+// Allocate the persistent decode scalars on first use. Returns the state: 1
+// when reuse is active, -1 when the device cannot serve the host-local,
+// device-visible heap (the caller keeps today's per-step allocation path).
+static int32_t xla_step_scalars_ensure(xla_ctx* c, int32_t position_count) {
+  if (c->step_scalars_state != 0) {
+    // A context has one fixed position mode, so the shape can only disagree
+    // with a direct C caller that switched modes on it; use the per-step path.
+    if (c->step_scalars_state == 1 &&
+        c->step_position_count != position_count) {
+      return -1;
+    }
+    return c->step_scalars_state;
+  }
+  c->step_scalars_state = -1;
+  iree_hal_dim_t pos_shape[1] = {3};
+  iree_status_t status = xla_alloc_step_scalar(
+      c, &kStepScalarParams, 0, NULL, sizeof(int32_t), &c->step_token,
+      &c->step_token_map);
+  if (iree_status_is_ok(status)) {
+    status = xla_alloc_step_scalar(c, &kStepScalarParams, 0, NULL,
+                                   sizeof(int32_t), &c->step_len,
+                                   &c->step_len_map);
+  }
+  if (iree_status_is_ok(status)) {
+    status = xla_alloc_step_scalar(
+        c, &kStepScalarParams, position_count > 1 ? 1 : 0,
+        position_count > 1 ? pos_shape : NULL,
+        (iree_host_size_t)position_count * sizeof(int32_t), &c->step_pos,
+        &c->step_pos_map);
+  }
+  if (iree_status_is_ok(status)) {
+    status = xla_alloc_step_scalar(c, &kStepResultParams, 0, NULL,
+                                   sizeof(int32_t), &c->decode_result,
+                                   &c->decode_result_map);
+  }
+  if (!iree_status_is_ok(status)) {
+    // Degrade to the per-step allocation path, but say so once: a driver that
+    // cannot serve this heap is worth seeing in a log.
+    fprintf(stderr,
+            "xla_iree: persistent decode scalars unavailable, using per-step "
+            "allocations (status %d):\n",
+            iree_status_code(status));
+    iree_status_fprint(stderr, status);
+    iree_status_ignore(status);
+    xla_release_step_scalars(c);
+    return -1;
+  }
+  c->step_position_count = position_count;
+  c->step_scalars_state = 1;
+  return 1;
+}
+
+// Zero a device-local buffer with a queue-ordered device fill and wait for it,
+// so the caller never needs a host mirror of the buffer.
+static iree_status_t xla_zero_fill_device(xla_ctx* c, iree_hal_buffer_t* buffer,
+                                          iree_device_size_t bytes) {
+  iree_hal_semaphore_t* fence = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_semaphore_create(
+      c->device, IREE_HAL_QUEUE_AFFINITY_ANY, 0ull,
+      IREE_HAL_SEMAPHORE_FLAG_DEFAULT, &fence));
+  uint64_t signal_value = 1ull;
+  iree_hal_semaphore_list_t signal_list = {
+      .count = 1, .semaphores = &fence, .payload_values = &signal_value};
+  // A 4-byte zero pattern is the natural f32 fill and a legal HAL pattern
+  // length (1, 2, 4 or 8 bytes).
+  uint32_t zero = 0;
+  iree_status_t status = iree_hal_device_queue_fill(
+      c->device, IREE_HAL_QUEUE_AFFINITY_ANY,
+      iree_hal_semaphore_list_empty(), signal_list, buffer, 0, bytes, &zero,
+      sizeof(zero), IREE_HAL_FILL_FLAG_NONE);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_semaphore_wait(fence, signal_value,
+                                     iree_infinite_timeout(),
+                                     IREE_ASYNC_WAIT_FLAG_NONE);
+  }
+  iree_hal_semaphore_release(fence);
+  return status;
+}
+
+// Allocate a zeroed device-local buffer view without a host mirror. The fill is
+// awaited before the view is published, so no un-awaited fill can escape.
+static iree_status_t xla_alloc_zeroed_bv(xla_ctx* c, iree_host_size_t rank,
+                                         const iree_hal_dim_t* shape,
+                                         iree_hal_element_type_t elt,
+                                         iree_device_size_t nbytes,
+                                         iree_hal_buffer_view_t** out) {
+  iree_hal_buffer_t* buffer = NULL;
+  IREE_RETURN_IF_ERROR(iree_hal_allocator_allocate_buffer(
+      c->allocator, kDeviceLocalParams, nbytes, &buffer));
+  iree_status_t status = xla_zero_fill_device(c, buffer, nbytes);
+  if (iree_status_is_ok(status)) {
+    status = iree_hal_buffer_view_create(
+        buffer, rank, shape, elt, IREE_HAL_ENCODING_TYPE_DENSE_ROW_MAJOR,
+        iree_runtime_instance_host_allocator(c->instance), out);
+  }
+  iree_hal_buffer_release(buffer);
+  return status;
 }
 
 // Push the request-scoped Phi4MM adapter mode immediately after resident
@@ -392,6 +697,29 @@ static int xla_validate_tensor_desc(const char* name,
             "xla_iree: invalid %s descriptor byte_length=%zu (want %zu)\n",
             name, desc->byte_length, expected_bytes);
     return 1;
+  }
+  return 0;
+}
+
+// Reject any prefill position outside [0, context_capacity) before the graph
+// runs (issue #2954). The emitted prefill graph indexes the
+// [context_capacity, rot] RoPE table with the caller's values and clamps
+// nothing, so an out-of-range value is an out-of-bounds device read rather than
+// an error the graph can report. All `count` entries of every M-RoPE axis are
+// checked, because the padded tail (real_len < count) reaches the same gather.
+// `positions` is axis-major: `axis * count + index`.
+static int xla_check_prefill_positions(const char* caller,
+                                       const int32_t* positions, int32_t count,
+                                       int32_t axes, int32_t context_capacity) {
+  for (int32_t axis = 0; axis < axes; ++axis) {
+    for (int32_t i = 0; i < count; ++i) {
+      const int32_t value = positions[(size_t)axis * (size_t)count + (size_t)i];
+      if (value < 0 || value >= context_capacity) {
+        fprintf(stderr, "%s: position[axis=%d index=%d]=%d outside [0,%d)\n",
+                caller, axis, i, value, context_capacity);
+        return 1;
+      }
+    }
   }
   return 0;
 }
@@ -710,6 +1038,18 @@ int xla_llama_upload_weight(xla_ctx* c, int32_t i, const void* weight_data,
     iree_status_ignore(s);
     return 1;
   }
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  {
+    iree_host_size_t elements = 1;
+    for (int32_t d = 0; d < weight_rank; d++) {
+      elements *= (iree_host_size_t)weight_dims[d];
+    }
+    const iree_host_size_t esize =
+        weight_dtype == 1 ? 2 : 4;  // f16, else f32 / packed U32
+    xla_test_weight_upload_calls += 1;
+    xla_test_weight_upload_bytes += (uint64_t)(elements * esize);
+  }
+#endif
   return 0;
 }
 
@@ -896,10 +1236,20 @@ int xla_llama_prefill(xla_ctx* c, int32_t adapter_mode,
                       const int32_t* tokens, int32_t lp,
                       const int32_t* positions, int32_t real_len,
                       int32_t* out_token) {
+  if (!c || !tokens || !positions || !out_token) {
+    fprintf(stderr,
+            "xla_llama_prefill: invalid context/token/position/output contract\n");
+    return 1;
+  }
   if (lp != c->context_capacity || real_len < 0 || real_len > lp) {
     fprintf(stderr,
             "xla_llama_prefill: lp=%d real_len=%d context_capacity=%d\n", lp,
             real_len, c->context_capacity);
+    return 1;
+  }
+  if (xla_check_prefill_positions(
+          "xla_llama_prefill", positions, lp,
+          c->position_mode == 1 ? 3 : 1, c->context_capacity) != 0) {
     return 1;
   }
   iree_runtime_call_t call;
@@ -974,6 +1324,11 @@ static int xla_llama_decode_impl(xla_ctx* c, int32_t adapter_mode,
                                  const int32_t* positions,
                                  int32_t position_mode, int32_t cache_len,
                                  int32_t* out_token) {
+  if (!c || !positions || !out_token) {
+    fprintf(stderr,
+            "xla_llama_decode: invalid context/position/output contract\n");
+    return 1;
+  }
   if (!c->kcache || !c->vcache || c->position_mode != position_mode ||
       cache_len < 0 || cache_len >= c->context_capacity) {
     fprintf(stderr,
@@ -986,6 +1341,18 @@ static int xla_llama_decode_impl(xla_ctx* c, int32_t adapter_mode,
     if (positions[axis] < 0) {
       fprintf(stderr, "xla_llama_decode: position axis %d is negative (%d)\n",
               axis, positions[axis]);
+      return 1;
+    }
+    // The graph indexes the [context_capacity, rot] RoPE table by this
+    // coordinate (the 1-D path directly, M-RoPE through the same bound), so a
+    // value at or past the capacity is an out-of-bounds device read. The Rust
+    // callers reject first; this keeps a direct C caller from bypassing that
+    // bound on the single-sequence entry points too (issue #2923).
+    if (positions[axis] >= c->context_capacity) {
+      fprintf(stderr,
+              "xla_llama_decode: position axis %d coordinate=%d "
+              "context_capacity=%d\n",
+              axis, positions[axis], c->context_capacity);
       return 1;
     }
   }
@@ -1002,16 +1369,37 @@ static int xla_llama_decode_impl(xla_ctx* c, int32_t adapter_mode,
   iree_hal_buffer_view_t* tok_bv = NULL;
   iree_hal_buffer_view_t* pos_bv = NULL;
   iree_hal_buffer_view_t* len_bv = NULL;
-  XLA_CHECK(xla_alloc_bv(c, 0, NULL, IREE_HAL_ELEMENT_TYPE_INT_32, &token,
-                         sizeof(int32_t), &tok_bv));
-  iree_hal_dim_t position_shape[1] = {3};
-  XLA_CHECK(xla_alloc_bv(c, position_mode == 1 ? 1 : 0,
-                         position_mode == 1 ? position_shape : NULL,
-                         IREE_HAL_ELEMENT_TYPE_INT_32, positions,
-                         (iree_host_size_t)position_count * sizeof(int32_t),
-                         &pos_bv));
-  XLA_CHECK(xla_alloc_bv(c, 0, NULL, IREE_HAL_ELEMENT_TYPE_INT_32, &cache_len,
-                         sizeof(int32_t), &len_bv));
+  // Steady-state decode writes the three scalars into buffers allocated and
+  // mapped once, instead of allocating a fresh pinned staging buffer per input
+  // (see xla_step_scalars_ensure). Fall back to per-step allocation when the
+  // device cannot serve that heap.
+  bool owns_scalars = true;
+  if (xla_step_scalars_ensure(c, position_count) == 1) {
+    owns_scalars = false;
+    *(int32_t*)c->step_token_map.contents.data = token;
+    *(int32_t*)c->step_len_map.contents.data = cache_len;
+    memcpy(c->step_pos_map.contents.data, positions,
+           (size_t)position_count * sizeof(int32_t));
+    tok_bv = c->step_token;
+    pos_bv = c->step_pos;
+    len_bv = c->step_len;
+  } else {
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+    // One per input view. Counted here rather than inside xla_alloc_bv so the
+    // prefill and ragged allocations do not distort it.
+    xla_test_decode_scalar_alloc_calls += 3;
+#endif
+    XLA_CHECK(xla_alloc_bv(c, 0, NULL, IREE_HAL_ELEMENT_TYPE_INT_32, &token,
+                           sizeof(int32_t), &tok_bv));
+    iree_hal_dim_t position_shape[1] = {3};
+    XLA_CHECK(xla_alloc_bv(c, position_mode == 1 ? 1 : 0,
+                           position_mode == 1 ? position_shape : NULL,
+                           IREE_HAL_ELEMENT_TYPE_INT_32, positions,
+                           (iree_host_size_t)position_count * sizeof(int32_t),
+                           &pos_bv));
+    XLA_CHECK(xla_alloc_bv(c, 0, NULL, IREE_HAL_ELEMENT_TYPE_INT_32, &cache_len,
+                           sizeof(int32_t), &len_bv));
+  }
   XLA_CHECK(iree_runtime_call_inputs_push_back_buffer_view(&call, tok_bv));
   XLA_CHECK(iree_runtime_call_inputs_push_back_buffer_view(&call, pos_bv));
   XLA_CHECK(iree_runtime_call_inputs_push_back_buffer_view(&call, len_bv));
@@ -1030,9 +1418,11 @@ static int xla_llama_decode_impl(xla_ctx* c, int32_t adapter_mode,
     iree_hal_buffer_view_release(token_out);
     iree_hal_buffer_view_release(kc);
     iree_hal_buffer_view_release(vc);
-    iree_hal_buffer_view_release(tok_bv);
-    iree_hal_buffer_view_release(pos_bv);
-    iree_hal_buffer_view_release(len_bv);
+    if (owns_scalars) {
+      iree_hal_buffer_view_release(tok_bv);
+      iree_hal_buffer_view_release(pos_bv);
+      iree_hal_buffer_view_release(len_bv);
+    }
     if (mode_bv) iree_hal_buffer_view_release(mode_bv);
     iree_runtime_call_deinitialize(&call);
     return 1;
@@ -1042,12 +1432,14 @@ static int xla_llama_decode_impl(xla_ctx* c, int32_t adapter_mode,
   c->kcache = kc;
   c->vcache = vc;
 
-  XLA_CHECK(xla_read_token(c, token_out, out_token));
+  XLA_CHECK(xla_read_token_decode(c, token_out, out_token));
 
   iree_hal_buffer_view_release(token_out);
-  iree_hal_buffer_view_release(tok_bv);
-  iree_hal_buffer_view_release(pos_bv);
-  iree_hal_buffer_view_release(len_bv);
+  if (owns_scalars) {
+    iree_hal_buffer_view_release(tok_bv);
+    iree_hal_buffer_view_release(pos_bv);
+    iree_hal_buffer_view_release(len_bv);
+  }
   if (mode_bv) iree_hal_buffer_view_release(mode_bv);
   iree_runtime_call_deinitialize(&call);
   // The old KV was an input to this call; the call held a ref during invoke and
@@ -1085,7 +1477,12 @@ int xla_llama_decode_mrope(xla_ctx* c, int32_t adapter_mode, int32_t token,
 // the rank-4 dims the first prefill_slot captured. Inactive slots stay zeroed
 // until a prefill_slot overwrites their region; the ragged decode's per-row mask
 // makes a zeroed (cache_len 0) slot a harmless no-op whose output is discarded.
-static iree_status_t xla_ensure_batch_kv(xla_ctx* c) {
+//
+// The zeroing is a device fill on each cache, not a host mirror: the rank-5
+// cache is hundreds of MiB at B=4 and capacity 2048, so a calloc plus two full
+// host-to-device uploads doubled the first admit's cost for no benefit
+// (issue #2923).
+static iree_status_t xla_ensure_batch_kv_inner(xla_ctx* c) {
   if (c->kcache_b && c->vcache_b) return iree_ok_status();
   if (c->rg_bsz <= 0 || c->rg_per == 0 ||
       (iree_host_size_t)c->rg_bsz > SIZE_MAX / c->rg_per) {
@@ -1098,17 +1495,15 @@ static iree_status_t xla_ensure_batch_kv(xla_ctx* c) {
                             "batch KV byte count overflowed");
   }
   iree_host_size_t bytes = count * sizeof(float);
-  float* zeros = (float*)calloc((size_t)count, sizeof(float));
-  if (!zeros) return iree_make_status(IREE_STATUS_RESOURCE_EXHAUSTED);
   iree_hal_dim_t shape5[5] = {(iree_hal_dim_t)c->rg_bsz, c->rg_dims[0],
                               c->rg_dims[1], c->rg_dims[2], c->rg_dims[3]};
-  iree_status_t s = xla_alloc_bv(c, 5, shape5, IREE_HAL_ELEMENT_TYPE_FLOAT_32,
-                                 zeros, bytes, &c->kcache_b);
+  iree_status_t s = xla_alloc_zeroed_bv(c, 5, shape5,
+                                        IREE_HAL_ELEMENT_TYPE_FLOAT_32, bytes,
+                                        &c->kcache_b);
   if (iree_status_is_ok(s)) {
-    s = xla_alloc_bv(c, 5, shape5, IREE_HAL_ELEMENT_TYPE_FLOAT_32, zeros, bytes,
-                     &c->vcache_b);
+    s = xla_alloc_zeroed_bv(c, 5, shape5, IREE_HAL_ELEMENT_TYPE_FLOAT_32,
+                            bytes, &c->vcache_b);
   }
-  free(zeros);
   if (!iree_status_is_ok(s)) {
     if (c->kcache_b) {
       iree_hal_buffer_view_release(c->kcache_b);
@@ -1120,6 +1515,17 @@ static iree_status_t xla_ensure_batch_kv(xla_ctx* c) {
     }
   }
   return s;
+}
+
+static iree_status_t xla_ensure_batch_kv(xla_ctx* c) {
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  xla_test_bk_window = true;
+#endif
+  iree_status_t status = xla_ensure_batch_kv_inner(c);
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  xla_test_bk_window = false;
+#endif
+  return status;
 }
 
 // Copy one rank-4 prefill KV pair directly into the selected region of the
@@ -1161,25 +1567,84 @@ static int xla_store_prefill_kv_slot(xla_ctx* c, int32_t slot,
     return 1;
   }
   iree_device_size_t off = (iree_device_size_t)slot * len;
+  // The store becomes visible only once both transfers have completed. Clear
+  // the slot's flag first so a failure part-way through leaves it invalid
+  // rather than half-written; the K bytes are not rolled back, because the
+  // engine re-prefills a slot before it is admitted again (issue #2923).
+  if (c->rg_valid) c->rg_valid[slot] = 0;
   XLA_CHECK(iree_hal_device_transfer_d2d(
       c->device, iree_hal_buffer_view_buffer(kc), 0,
       iree_hal_buffer_view_buffer(c->kcache_b), off, len,
       IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout()));
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+  if (c->rg_fail_slot_store) {
+    fprintf(stderr,
+            "xla_iree: test hook: simulated V slot store failure at slot=%d\n",
+            slot);
+    return 1;
+  }
+#endif
   XLA_CHECK(iree_hal_device_transfer_d2d(
       c->device, iree_hal_buffer_view_buffer(vc), 0,
       iree_hal_buffer_view_buffer(c->vcache_b), off, len,
       IREE_HAL_TRANSFER_BUFFER_FLAG_DEFAULT, iree_infinite_timeout()));
+  if (c->rg_valid) c->rg_valid[slot] = 1;
+  return 0;
+}
+
+// Record the batch size compiled into this context's ragged decode graph.
+// Must be called once after the context is created and before the first reset;
+// the graph's static [B,...] shapes cannot be renegotiated at runtime.
+int xla_llama_ragged_bind(xla_ctx* c, int32_t compiled_b) {
+  if (!c || compiled_b <= 0) {
+    fprintf(stderr,
+            "xla_llama_ragged_bind: invalid context or compiled_b=%d\n",
+            compiled_b);
+    return 1;
+  }
+  c->rg_compiled_b = compiled_b;
   return 0;
 }
 
 // Reset the batched state for `bsz` slots: drop any rank-5 KV and forget the
 // per-slot dims (re-captured by the next prefill_slot, which lazily reallocates
 // the rank-5 KV once the dims are known). Call once before seeding slots.
+//
+// `bsz` must equal the batch size baked into this context's ragged decode
+// graph. The graph's [B,...] shapes are static, so any other value used to fail
+// deep inside IREE as an opaque shape mismatch; reject it here with both values
+// instead. `xla_llama_ragged_bind` must have recorded that size first.
 int xla_llama_ragged_reset(xla_ctx* c, int32_t bsz) {
-  if (bsz <= 0) {
-    fprintf(stderr, "xla_llama_ragged_reset: bsz must be positive\n");
+  if (!c || bsz <= 0) {
+    fprintf(stderr, "xla_llama_ragged_reset: bsz must be positive, got %d\n",
+            bsz);
     return 1;
   }
+  if (c->rg_compiled_b <= 0) {
+    fprintf(stderr,
+            "xla_llama_ragged_reset: no compiled ragged batch size is bound "
+            "(bsz=%d); call xla_llama_ragged_bind first\n",
+            bsz);
+    return 1;
+  }
+  if (bsz != c->rg_compiled_b) {
+    fprintf(stderr,
+            "xla_llama_ragged_reset: bsz=%d does not match the compiled ragged "
+            "batch size compiled_b=%d\n",
+            bsz, c->rg_compiled_b);
+    return 1;
+  }
+  // Fresh per-slot validity: a reset must not inherit any slot state from the
+  // previous batch (issue #2923).
+  uint8_t* valid = (uint8_t*)calloc((size_t)bsz, sizeof(uint8_t));
+  if (!valid) {
+    fprintf(stderr,
+            "xla_llama_ragged_reset: failed to allocate %d slot validity flags\n",
+            bsz);
+    return 1;
+  }
+  free(c->rg_valid);
+  c->rg_valid = valid;
   c->rg_bsz = bsz;
   c->rg_per = 0;
   if (c->kcache_b) {
@@ -1231,6 +1696,11 @@ int xla_llama_prefill_slot_logits(
               tokens[i], vocab);
       return 1;
     }
+  }
+  if (xla_check_prefill_positions(
+          "xla_llama_prefill_slot_logits", positions, lp,
+          c->position_mode == 1 ? 3 : 1, c->context_capacity) != 0) {
+    return 1;
   }
 
   int rc = 0;
@@ -1308,6 +1778,26 @@ cleanup:
   return rc;
 }
 
+#ifdef MLXCEL_XLA_TEST_SUPPORT
+// Test support (issue #2954): forward to the real prefill entry points with
+// caller-supplied positions. The public Rust API synthesizes canonical
+// positions and rejects out-of-range explicit ones before reaching C, so a
+// device test cannot otherwise prove the C boundary itself enforces the bound.
+int32_t xla_test_prefill(xla_ctx* c, const int32_t* tokens, int32_t lp,
+                         const int32_t* positions, int32_t real_len,
+                         int32_t* out_token) {
+  return xla_llama_prefill(c, 0, tokens, lp, positions, real_len, out_token);
+}
+
+int32_t xla_test_prefill_slot_logits(xla_ctx* c, int32_t slot,
+                                     const int32_t* tokens, int32_t lp,
+                                     const int32_t* positions, int32_t real_len,
+                                     int32_t vocab, float* out_logits) {
+  return xla_llama_prefill_slot_logits(c, slot, 0, tokens, lp, positions,
+                                       real_len, vocab, out_logits);
+}
+#endif
+
 // Test-only Gemma3n intermediate-oracle entry. The optional diagnostic module
 // is never loaded by normal bundles. Its first output is one statically laid
 // out f32 vector; K/V are handled exactly like ordinary slot prefill so the
@@ -1316,11 +1806,17 @@ int xla_llama_prefill_diagnostics_slot(
     xla_ctx* c, int32_t slot, int32_t adapter_mode, const int32_t* tokens,
     int32_t lp, const int32_t* positions, int32_t real_len,
     int32_t diagnostic_len, float* out_diagnostics) {
-  if (!c || !c->has_prefill_diagnostics || slot < 0 || slot >= c->rg_bsz ||
+  if (!c || !c->has_prefill_diagnostics || !tokens || !positions ||
+      slot < 0 || slot >= c->rg_bsz ||
       lp != c->context_capacity || real_len <= 0 || real_len > lp ||
       diagnostic_len <= 0 || !out_diagnostics) {
     fprintf(stderr,
             "xla_llama_prefill_diagnostics_slot: invalid diagnostic bundle/input contract\n");
+    return 1;
+  }
+  if (xla_check_prefill_positions(
+          "xla_llama_prefill_diagnostics_slot", positions, lp,
+          c->position_mode == 1 ? 3 : 1, c->context_capacity) != 0) {
     return 1;
   }
   int rc = 0;
@@ -1438,6 +1934,15 @@ static int xla_llama_prefill_embeddings_impl(
                                 dense_ple_dims) != 0)) {
     fprintf(stderr,
             "xla_llama_prefill_embeddings: dense PLE does not match bundle kind\n");
+    return 1;
+  }
+  // The descriptor check above proves the buffer holds exactly
+  // `context_capacity` positions per axis, so every slot reaches the graph's
+  // RoPE gather and must be bounded here (issue #2954).
+  if (xla_check_prefill_positions(
+          "xla_llama_prefill_embeddings", (const int32_t*)positions->data,
+          c->context_capacity, position_mode == 1 ? 3 : 1,
+          c->context_capacity) != 0) {
     return 1;
   }
   bool batched = slot >= 0;
@@ -1919,8 +2424,12 @@ static int xla_llama_decode_ragged_impl(
       return 1;
     }
     int32_t position_count = position_mode == 1 ? 3 : 1;
+    // The engine sends an inactive row as all zeros (token, positions and
+    // cache_len); anything else is a row it expects to advance.
+    bool active = tokens[i] != 0 || cache_len[i] != 0;
     for (int32_t axis = 0; axis < position_count; ++axis) {
       int32_t coordinate = positions[i * position_count + axis];
+      if (coordinate != 0) active = true;
       if (coordinate < 0 ||
           (position_mode == 0 && coordinate != cache_len[i])) {
         fprintf(stderr,
@@ -1928,6 +2437,28 @@ static int xla_llama_decode_ragged_impl(
                 i, axis, coordinate, cache_len[i]);
         return 1;
       }
+      // The ragged graph indexes the [context_capacity, rot] RoPE table by this
+      // coordinate, so a value at or past the capacity is an out-of-bounds
+      // device read. The Rust caller rejects first; this keeps a direct C
+      // caller from bypassing that bound (issue #2923).
+      if (coordinate >= c->context_capacity) {
+        fprintf(stderr,
+                "xla_llama_decode_ragged_logits: row=%d axis=%d coordinate=%d "
+                "context_capacity=%d\n",
+                i, axis, coordinate, c->context_capacity);
+        return 1;
+      }
+    }
+    // A row whose KV was only half-written (or never stored) must not reach
+    // the graph: decoding it would read a torn prompt. Inactive rows are
+    // exempt because they are exactly the all-zero rows the engine uses for
+    // free slots (issue #2923).
+    if (active && (!c->rg_valid || !c->rg_valid[i])) {
+      fprintf(stderr,
+              "xla_llama_decode_ragged_logits: row=%d slot=%d token=%d "
+              "cache_len=%d is active but its KV slot is not valid\n",
+              i, i, tokens[i], cache_len[i]);
+      return 1;
     }
   }
 
@@ -2060,6 +2591,8 @@ void xla_llama_free(xla_ctx* c) {
   if (c->vcache) iree_hal_buffer_view_release(c->vcache);
   if (c->kcache_b) iree_hal_buffer_view_release(c->kcache_b);
   if (c->vcache_b) iree_hal_buffer_view_release(c->vcache_b);
+  xla_release_step_scalars(c);
+  free(c->rg_valid);
   free(c->deepstack_target_layers);
   if (c->session) iree_runtime_session_release(c->session);
   if (c->device) iree_hal_device_release(c->device);

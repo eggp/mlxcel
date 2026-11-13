@@ -529,7 +529,7 @@ pub(crate) fn mtp_prefill_suffix_start(
 /// The batch-capable half keyed on `has_neural_accelerator` (M5 only) until
 /// #1217 measured M3 Ultra on this pairing for the first time and found 1.95x
 /// to 2.65x on a host the old predicate declined. The rows are in
-/// `docs/benchmark_results/mtp-b1-gate-m3ultra-2026-08-20.md`.
+/// `docs/benchmark_results/versions/v0.6.0.md#mtp-b1-gate-m3ultra-2026-08-20`.
 ///
 /// The discriminator is the `use_qmv_wide` split documented in
 /// `crate::models::speculative_exactness`, not the Neural Accelerator: from
@@ -583,7 +583,7 @@ pub(crate) fn mtp_b1_burst_enabled(target_supports_batching: bool) -> bool {
 /// profitability. Issue #1983 restores 31B QAT/non-QAT singleton exactness by
 /// matching classic attention geometry; that correction has a measured cost,
 /// so the pre-probe #1217 speedups are not promises for the corrected path.
-/// See docs/benchmark_results/gemma4-31b-mtp-exactness-2026-09-26.md.
+/// See docs/benchmark_results/versions/v0.8.0.md#gemma4-31b-mtp-exactness-2026-09-26.
 /// Used by: Gemma 4 and Qwen 3.5 MTP policy fallback.
 ///
 /// `wide_quantized_projections` is the host's Apple GPU generation reduced to
@@ -1117,15 +1117,15 @@ pub(crate) struct BurstContext<'a> {
     /// the DFlash and batched burst arms.
     pub(crate) profile_probe_rounds: usize,
     pub(crate) prefill_chunk_size: usize,
-    /// Classic history-boundary prefill split for the B=1 sequence (issue
-    /// #2160); `None` for batched bursts and requests without one.
-    pub(crate) prefill_boundary: Option<usize>,
+    /// Classic snapshot-boundary prefill splits for the B=1 sequence (issue
+    /// #2160, #2885); empty for batched bursts and requests without one.
+    pub(crate) prefill_boundary: mlxcel_core::prefill_plan::PrefillSplits,
     /// The scheduler's context bound (#1472), applied by the burst stream's
     /// finish step exactly as classic decode applies it (#2168).
     pub(crate) context_bound: ContextBound,
     /// The same split for each row of a batched window, in window order
     /// (issue #2190); empty for B=1 bursts.
-    pub(crate) prefill_boundaries: Vec<Option<usize>>,
+    pub(crate) prefill_boundaries: Vec<mlxcel_core::prefill_plan::PrefillSplits>,
 }
 
 impl<'a> BurstContext<'a> {
@@ -3150,7 +3150,7 @@ mod tests {
     /// M3 is the row this issue moved, and it moved on measurement: the
     /// 31B + bf16 assistant pairing runs 1.95x to 2.65x on an M3 Ultra that
     /// the previous `has_neural_accelerator` predicate declined
-    /// (`docs/benchmark_results/mtp-b1-gate-m3ultra-2026-08-20.md`).
+    /// (`docs/benchmark_results/versions/v0.6.0.md#mtp-b1-gate-m3ultra-2026-08-20`).
     #[test]
     fn mtp_b1_default_batch_capable_follows_gpu_generation() {
         use mlxcel_core::hardware::AppleSiliconGen;

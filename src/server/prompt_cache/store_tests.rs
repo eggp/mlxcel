@@ -1233,3 +1233,120 @@ fn snapshot_growth_bytes_counts_only_what_the_budget_has_left() {
     assert_eq!(store.snapshot_growth_bytes(100), 100);
     assert_eq!(store.snapshot_capacity_bytes(), 10_000);
 }
+
+/// #2885 Part B: a system-prompt root survives LRU pressure while roots hold
+/// at most half of the snapshot budget, even when it is the oldest entry.
+#[test]
+fn system_root_is_passed_over_by_lru_while_roots_fit_half_the_budget() {
+    let store = PromptCacheStore::with_config(snapshot_cfg(10_000));
+    let root = tokens(0, 16);
+    let chat_b = tokens(100, 24);
+    let chat_c = tokens(200, 24);
+    store
+        .insert_snapshot(
+            &key_for_session("m", Some("s"), &root),
+            ModelSnapshotEntry::new_for_test(root.clone(), "qwen4_exp", 3_000)
+                .with_origin(SnapshotOrigin::SystemRoot),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    store
+        .insert_snapshot(
+            &key_for_session("m", Some("s"), &chat_b),
+            ModelSnapshotEntry::new_for_test(chat_b.clone(), "qwen4_exp", 4_000),
+        )
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(2));
+    store
+        .insert_snapshot(
+            &key_for_session("m", Some("s"), &chat_c),
+            ModelSnapshotEntry::new_for_test(chat_c.clone(), "qwen4_exp", 4_000),
+        )
+        .unwrap();
+
+    let stats = store.stats();
+    assert_eq!(stats.snapshot_entries, 2);
+    assert_eq!(stats.snapshot_evictions_lru, 1);
+    assert!(
+        store
+            .lookup_snapshot_prefix(&key_for_session("m", Some("s"), &root), &root)
+            .is_some(),
+        "the oldest entry was the root, and it was kept"
+    );
+    assert!(
+        store
+            .lookup_snapshot_prefix(&key_for_session("m", Some("s"), &chat_b), &chat_b)
+            .is_none(),
+        "the oldest non-root entry was evicted instead"
+    );
+}
+
+/// Past half of the budget, roots compete under plain LRU, so a churn of
+/// distinct system prompts cannot pin the store.
+#[test]
+fn system_roots_over_half_the_budget_fall_back_to_plain_lru() {
+    let store = PromptCacheStore::with_config(snapshot_cfg(10_000));
+    let root_a = tokens(0, 16);
+    let root_b = tokens(300, 16);
+    let chat = tokens(100, 24);
+    for root in [&root_a, &root_b] {
+        store
+            .insert_snapshot(
+                &key_for_session("m", Some("s"), root),
+                ModelSnapshotEntry::new_for_test(root.clone(), "qwen4_exp", 3_000)
+                    .with_origin(SnapshotOrigin::SystemRoot),
+            )
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    store
+        .insert_snapshot(
+            &key_for_session("m", Some("s"), &chat),
+            ModelSnapshotEntry::new_for_test(chat.clone(), "qwen4_exp", 5_000),
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .lookup_snapshot_prefix(&key_for_session("m", Some("s"), &root_a), &root_a)
+            .is_none(),
+        "6,000 bytes of roots exceed half of 10,000, so the oldest root goes"
+    );
+    assert!(
+        store
+            .lookup_snapshot_prefix(&key_for_session("m", Some("s"), &chat), &chat)
+            .is_some()
+    );
+}
+
+/// #2885 Part B: periodic checkpoints of one conversation are not collapsed by
+/// the session-chain supersede rule, so the shallower one stays available to a
+/// request that edits history between the two. A boundary chain still
+/// collapses as before.
+#[test]
+fn checkpoints_of_one_conversation_are_not_superseded() {
+    let store = PromptCacheStore::with_config(snapshot_cfg(1 << 20));
+    let first = tokens(0, 16);
+    let second = tokens(0, 32);
+    for ids in [&first, &second] {
+        store
+            .insert_snapshot(
+                &key_for_session("m", Some("chat-a"), ids),
+                ModelSnapshotEntry::new_for_test(ids.clone(), "qwen4_exp", 4_096)
+                    .with_origin(SnapshotOrigin::Checkpoint),
+            )
+            .unwrap();
+    }
+    let stats = store.stats();
+    assert_eq!(stats.snapshot_entries, 2);
+    assert_eq!(stats.snapshot_supersedes, 0);
+
+    // A request that diverges after token 20 matches the first checkpoint.
+    let mut edited = tokens(0, 20);
+    edited.extend(tokens(900, 12));
+    let (entry, matched) = store
+        .lookup_snapshot_prefix(&key_for_session("m", Some("chat-a"), &edited), &edited)
+        .expect("the shallower checkpoint is still stored");
+    assert_eq!(matched, first.len());
+    assert_eq!(entry.tokens, first);
+}
