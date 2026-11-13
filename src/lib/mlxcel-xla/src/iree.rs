@@ -201,6 +201,50 @@ impl WeightBuf {
             WeightBuf::Raw(v) => v.as_ptr(),
         }
     }
+
+    /// Bytes the shim copies for this weight (issue #2961: upload accounting).
+    fn byte_len(&self) -> u64 {
+        match self {
+            WeightBuf::F32(v) => (v.len() as u64) * 4,
+            WeightBuf::F16(v) => (v.len() as u64) * 2,
+            WeightBuf::Raw(v) => v.len() as u64,
+        }
+    }
+}
+
+/// What one `upload_weights_with_sink` pass spent, split by stage (issue #2961).
+///
+/// The ragged f16 load path reports about 4 s in `ragged-context-and-upload`,
+/// which lumps module load together with host dequantization, f16 packing and
+/// the device copies. These counters separate the three so the regression can
+/// be attributed instead of guessed.
+#[derive(Default)]
+struct WeightUploadStats {
+    /// Device uploads issued, one per weight spec.
+    tensors: usize,
+    /// Bytes copied to the device across every upload.
+    uploaded_bytes: u64,
+    /// Host widening: affine dequantization or bf16/f16/f32 conversion.
+    widen_micros: u128,
+    /// f16 packing of the widened projection weights.
+    pack_micros: u128,
+    /// Time inside the sink, i.e. the shim copy to the device.
+    upload_micros: u128,
+}
+
+impl WeightUploadStats {
+    /// Extra `key=value` fields appended to the phase line. Silent-free: the
+    /// caller only prints this when `MLXCEL_XLA_LOAD_TIMING` is set.
+    fn detail(&self) -> String {
+        format!(
+            "tensors={} uploaded_bytes={} dequantize_ms={} pack_ms={} copy_ms={}",
+            self.tensors,
+            self.uploaded_bytes,
+            self.widen_micros / 1000,
+            self.pack_micros / 1000,
+            self.upload_micros / 1000,
+        )
+    }
 }
 
 fn load_timing_enabled() -> bool {
@@ -217,13 +261,33 @@ fn current_rss_kib() -> Option<u64> {
 }
 
 fn report_load_timing(label: &str, started: std::time::Instant) {
+    report_load_timing_detail(label, started, None);
+}
+
+/// The one line format every load phase prints. Kept separate from the env gate
+/// so the shape is unit-testable without touching process-global environment.
+fn load_timing_line(label: &str, elapsed_ms: u128, rss_kib: &str, detail: Option<&str>) -> String {
+    match detail {
+        Some(detail) => {
+            format!(
+                "mlxcel-xla-load: phase={label} elapsed_ms={elapsed_ms} rss_kib={rss_kib} {detail}"
+            )
+        }
+        None => format!("mlxcel-xla-load: phase={label} elapsed_ms={elapsed_ms} rss_kib={rss_kib}"),
+    }
+}
+
+/// [`report_load_timing`] with extra `key=value` fields, for a phase that has
+/// counters of its own (issue #2961). One env gate and one line format: a
+/// detail line stays silent unless `MLXCEL_XLA_LOAD_TIMING` is set.
+fn report_load_timing_detail(label: &str, started: std::time::Instant, detail: Option<&str>) {
     if load_timing_enabled() {
+        let rss = current_rss_kib()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_string());
         eprintln!(
-            "mlxcel-xla-load: phase={label} elapsed_ms={} rss_kib={}",
-            started.elapsed().as_millis(),
-            current_rss_kib()
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "unavailable".to_string())
+            "{}",
+            load_timing_line(label, started.elapsed().as_millis(), &rss, detail)
         );
     }
 }
@@ -299,6 +363,68 @@ unsafe extern "C" {
     // copy the per-row `[vocab]` logits to host so the engine samples there (Stage
     // 2d). `prefill_slot_logits` also does the device-side KV slot write.
     fn xla_llama_ragged_reset(c: *mut XlaCtx, bsz: c_int) -> c_int;
+    /// Record the ragged batch size baked into this context's decode graph.
+    /// Must be called before the first `xla_llama_ragged_reset`.
+    fn xla_llama_ragged_bind(c: *mut XlaCtx, compiled_b: c_int) -> c_int;
+    /// Test support (issue #2923): host-mirror and host-to-device byte counters
+    /// for the lazy rank-5 batch-KV allocation path.
+    #[cfg(feature = "test-support")]
+    fn xla_test_batch_kv_host_bytes() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_batch_kv_h2d_bytes() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_batch_kv_reset_counters();
+    /// Test support (issue #2923): force the V transfer of the next prefill
+    /// slot store to fail, and read one slot's KV validity flag.
+    #[cfg(feature = "test-support")]
+    fn xla_test_set_slot_store_failure(c: *mut XlaCtx, fail: c_int);
+    #[cfg(feature = "test-support")]
+    fn xla_test_slot_valid(c: *const XlaCtx, slot: c_int) -> c_int;
+    /// Test support (issue #2961): resident-weight upload call and byte
+    /// counters, so a device test can prove every weight uploads once and a
+    /// bucket context uploads none.
+    #[cfg(feature = "test-support")]
+    fn xla_test_weight_upload_calls_get() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_weight_upload_bytes_get() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_weight_upload_reset();
+    /// Test support (issue #3028): per-decode-step staging allocation and
+    /// persistent readback counters, plus the state field and a hook that forces
+    /// the fallback path, so a device test can prove reuse and degradation.
+    #[cfg(feature = "test-support")]
+    fn xla_test_decode_scalar_alloc_calls_get() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_decode_d2d_readbacks_get() -> u64;
+    #[cfg(feature = "test-support")]
+    fn xla_test_decode_step_scalars_state(c: *const XlaCtx) -> c_int;
+    #[cfg(feature = "test-support")]
+    fn xla_test_decode_counters_reset();
+    #[cfg(feature = "test-support")]
+    fn xla_test_force_step_scalars_unsupported(c: *mut XlaCtx, unsupported: c_int);
+    /// Test support (issue #2954): reach the prefill C entry points with
+    /// caller-supplied positions, so a device test can prove the C boundary
+    /// rejects out-of-range values the public API never forwards.
+    #[cfg(feature = "test-support")]
+    fn xla_test_prefill(
+        c: *mut XlaCtx,
+        tokens: *const c_int,
+        lp: c_int,
+        positions: *const c_int,
+        real_len: c_int,
+        out_token: *mut c_int,
+    ) -> c_int;
+    #[cfg(feature = "test-support")]
+    fn xla_test_prefill_slot_logits(
+        c: *mut XlaCtx,
+        slot: c_int,
+        tokens: *const c_int,
+        lp: c_int,
+        positions: *const c_int,
+        real_len: c_int,
+        vocab: c_int,
+        out_logits: *mut f32,
+    ) -> c_int;
     fn xla_llama_prefill_slot_logits(
         c: *mut XlaCtx,
         slot: c_int,
@@ -476,6 +602,74 @@ unsafe extern "C" {
 /// ragged decode graph for the chosen `b_max` is emitted from the model config at
 /// load (any `b_max` is emittable; the worker selects from this set).
 pub(crate) const RAGGED_B_VALUES: &[usize] = &[4, 8];
+
+/// Test support (issue #2923): reset the shim's counters for host-resident and
+/// host-to-device bytes spent by the lazy rank-5 batch-KV allocation. A first
+/// admit must leave both at zero now that the caches are zeroed with a device
+/// fill instead of a host mirror.
+#[cfg(feature = "test-support")]
+pub fn reset_batch_kv_allocation_counters() {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe { xla_test_batch_kv_reset_counters() };
+}
+
+/// Test support (issue #2923): bytes the rank-5 batch-KV path has allocated or
+/// uploaded from host memory since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn batch_kv_allocation_counters() -> (u64, u64) {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe {
+        (
+            xla_test_batch_kv_host_bytes(),
+            xla_test_batch_kv_h2d_bytes(),
+        )
+    }
+}
+
+/// Test support (issue #2961): reset the shim's resident-weight upload counters
+/// before a load.
+#[cfg(feature = "test-support")]
+pub fn reset_weight_upload_counters() {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe { xla_test_weight_upload_reset() };
+}
+
+/// Test support (issue #2961): `(calls, bytes)` the shim has uploaded through
+/// `xla_llama_upload_weight` since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn weight_upload_counters() -> (u64, u64) {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe {
+        (
+            xla_test_weight_upload_calls_get(),
+            xla_test_weight_upload_bytes_get(),
+        )
+    }
+}
+
+/// Test support (issue #3028): reset the shim's per-decode-step staging and
+/// persistent-readback counters.
+#[cfg(feature = "test-support")]
+pub fn reset_decode_scalar_counters() {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe { xla_test_decode_counters_reset() };
+}
+
+/// Test support (issue #3028): `(scalar_alloc_calls, d2d_readbacks)` the single-
+/// sequence decode shim has made since the last reset.
+#[cfg(feature = "test-support")]
+#[must_use]
+pub fn decode_scalar_counters() -> (u64, u64) {
+    // Safety: the counters are process-global scalars with no aliasing rules.
+    unsafe {
+        (
+            xla_test_decode_scalar_alloc_calls_get(),
+            xla_test_decode_d2d_readbacks_get(),
+        )
+    }
+}
 
 #[derive(Clone, Debug)]
 enum RuntimeConfig {
@@ -1994,6 +2188,25 @@ fn upload_weights_with_sink<F>(
 where
     F: FnMut(usize, WeightBuf, c_int, c_int, [i64; 4]) -> Result<(), String>,
 {
+    let upload_started = std::time::Instant::now();
+    let mut stats = WeightUploadStats::default();
+    // One device upload: time the shim copy and account the bytes that crossed.
+    // The counters live on the stack here, so a macro (not a closure) keeps
+    // `stats` usable between the calls.
+    macro_rules! emit_weight {
+        ($i:expr, $buf:expr, $dtype:expr, $rank:expr, $dims:expr) => {{
+            let buf = $buf;
+            let bytes = buf.byte_len();
+            let started = std::time::Instant::now();
+            let result = sink($i, buf, $dtype, $rank, $dims);
+            stats.upload_micros += started.elapsed().as_micros();
+            if result.is_ok() {
+                stats.tensors += 1;
+                stats.uploaded_bytes += bytes;
+            }
+            result
+        }};
+    }
     let specs = cfg.weight_specs();
     let names: Vec<String> = specs.iter().map(|s| s.tensor_name().to_string()).collect();
     let (shard_paths, mut dense_name_scheme, gemma3n_name_scheme) = match cfg {
@@ -2085,6 +2298,7 @@ where
             let needs_widened = tensor_idxs
                 .iter()
                 .any(|&i| !matches!(specs[i], WeightSpec::QuantRaw { .. }));
+            let widen_started = std::time::Instant::now();
             let widened: Option<(Vec<f32>, Vec<usize>)> = if needs_widened {
                 // Widen the whole tensor to row-major `[out, in]` (or `[out]`) f32 (the
                 // graph's dtype): an MLX affine `U32`-packed weight is dequantized (the
@@ -2213,6 +2427,7 @@ where
             } else {
                 None
             };
+            stats.widen_micros += widen_started.elapsed().as_micros();
 
             let mut remaining = tensor_idxs.len();
             let mut owned_widened = widened;
@@ -2239,7 +2454,7 @@ where
                     let mut dims = [0i64; 4];
                     dims[0] = checked_ffi_i64(shape[0], &format!("weight {name} dim 0"))?;
                     dims[1] = checked_ffi_i64(shape[1], &format!("weight {name} dim 1"))?;
-                    sink(i, WeightBuf::Raw(t.data().to_vec()), code, 2, dims)?;
+                    emit_weight!(i, WeightBuf::Raw(t.data().to_vec()), code, 2, dims)?;
                     continue;
                 }
 
@@ -2258,7 +2473,7 @@ where
                         } else {
                             data_ref.clone()
                         };
-                        sink(i, WeightBuf::F32(data), WDT_F32, rank, dims)?;
+                        emit_weight!(i, WeightBuf::F32(data), WDT_F32, rank, dims)?;
                     }
                     WeightSpec::Proj(_) => {
                         if shape.len() != 2 {
@@ -2276,26 +2491,31 @@ where
                             dims[0] = checked_ffi_i64(in_, &format!("weight {name} in axis"))?;
                             dims[1] = checked_ffi_i64(out, &format!("weight {name} out axis"))?;
                             if resident_f16 {
-                                sink(i, WeightBuf::F16(pack_f16(&transposed)), WDT_F16, 2, dims)?;
+                                let pack_started = std::time::Instant::now();
+                                let packed = pack_f16(&transposed);
+                                stats.pack_micros += pack_started.elapsed().as_micros();
+                                emit_weight!(i, WeightBuf::F16(packed), WDT_F16, 2, dims)?;
                             } else {
-                                sink(i, WeightBuf::F32(transposed), WDT_F32, 2, dims)?;
+                                emit_weight!(i, WeightBuf::F32(transposed), WDT_F32, 2, dims)?;
                             }
                         } else {
                             dims[0] = checked_ffi_i64(out, &format!("weight {name} dim 0"))?;
                             dims[1] = checked_ffi_i64(in_, &format!("weight {name} dim 1"))?;
                             if resident_f16 {
+                                let pack_started = std::time::Instant::now();
                                 let packed = pack_f16(data_ref);
+                                stats.pack_micros += pack_started.elapsed().as_micros();
                                 if remaining == 0 {
                                     drop(owned_widened.take());
                                 }
-                                sink(i, WeightBuf::F16(packed), WDT_F16, 2, dims)?;
+                                emit_weight!(i, WeightBuf::F16(packed), WDT_F16, 2, dims)?;
                             } else {
                                 let data = if remaining == 0 {
                                     owned_widened.take().unwrap().0
                                 } else {
                                     data_ref.clone()
                                 };
-                                sink(i, WeightBuf::F32(data), WDT_F32, 2, dims)?;
+                                emit_weight!(i, WeightBuf::F32(data), WDT_F32, 2, dims)?;
                             }
                         }
                     }
@@ -2323,9 +2543,12 @@ where
                             drop(owned_widened.take());
                         }
                         if resident_f16 {
-                            sink(i, WeightBuf::F16(pack_f16(&data)), WDT_F16, 2, dims)?;
+                            let pack_started = std::time::Instant::now();
+                            let packed = pack_f16(&data);
+                            stats.pack_micros += pack_started.elapsed().as_micros();
+                            emit_weight!(i, WeightBuf::F16(packed), WDT_F16, 2, dims)?;
                         } else {
-                            sink(i, WeightBuf::F32(data), WDT_F32, 2, dims)?;
+                            emit_weight!(i, WeightBuf::F32(data), WDT_F32, 2, dims)?;
                         }
                     }
                     WeightSpec::Elements { start, end, .. } => {
@@ -2350,7 +2573,7 @@ where
                         if remaining == 0 {
                             drop(owned_widened.take());
                         }
-                        sink(i, buf, WDT_F32, 1, dims)?;
+                        emit_weight!(i, buf, WDT_F32, 1, dims)?;
                     }
                     WeightSpec::QuantRaw { .. } => {
                         unreachable!("QuantRaw is handled by the early-continue above")
@@ -2359,6 +2582,11 @@ where
             }
         }
     }
+    report_load_timing_detail(
+        "language-weight-upload-parts",
+        upload_started,
+        Some(&stats.detail()),
+    );
     Ok(())
 }
 
@@ -2438,6 +2666,7 @@ fn create_bucket_ctx(
         .transpose()?;
     let c_dec = path_cstring(&bundle.decode_vmfb)?;
     let capacity = checked_ffi_int(context_capacity, "context_capacity")?;
+    let bucket_started = std::time::Instant::now();
     // Safety: every pointer is a live CString owned above for the duration of
     // the call, `base` is a live context by this function's contract, and the
     // shim treats a null deepstack or diagnostics path as "this bundle has
@@ -2460,6 +2689,14 @@ fn create_bucket_ctx(
             "failed to create an OpenXLA capacity bucket at {context_capacity} tokens"
         ));
     }
+    // issue #2961: a bucket shares the base's resident weights, so it must
+    // report no upload at all. The line makes a re-upload regression visible in
+    // the same measurement that caught the load cost.
+    report_load_timing_detail(
+        "language-weight-upload-parts",
+        bucket_started,
+        Some("tensors=0 uploaded_bytes=0 dequantize_ms=0 pack_ms=0 copy_ms=0"),
+    );
     Ok(ctx)
 }
 
@@ -2514,6 +2751,11 @@ fn create_ctx_with_diagnostics(
     // Safety: pointers are valid for the duration of the call; passing null
     // weight pointers allocates the empty weight slot table so each tensor can
     // be uploaded and freed incrementally via `xla_llama_upload_weight`.
+    // issue #2961: split what was one opaque span. `xla_llama_create` builds the
+    // instance, opens the device, creates the session and loads the vmfb
+    // modules; the loop below is host prep plus device copies. Only the latter
+    // changes with the weight dtype, so the two must be reported apart.
+    let create_started = std::time::Instant::now();
     let ctx = unsafe {
         xla_llama_create(
             c_dev.as_ptr(),
@@ -2568,6 +2810,8 @@ fn create_ctx_with_diagnostics(
              (IREE runtime; see stderr for the annotated status)"
         ));
     }
+    report_load_timing("language-module-load", create_started);
+    let upload_started = std::time::Instant::now();
     if let Err(error) = upload_weights_with_sink(
         model_dir,
         cfg,
@@ -2597,6 +2841,7 @@ fn create_ctx_with_diagnostics(
         unsafe { xla_llama_free(ctx) };
         return Err(error);
     }
+    report_load_timing("language-weight-upload", upload_started);
     report_load_timing("language-vmfb-and-device-upload", load_started);
     Ok(ctx)
 }
@@ -2700,7 +2945,7 @@ impl IreeLlama {
             adapter_mode: 0,
             dense_ple_shape: cfg.dense_ple_shape(),
             position_mode: cfg.position_mode(),
-            decode_position: DecodePositionState::default(),
+            decode_position: DecodePositionState::new(cfg.context_capacity()),
             deepstack_schema: cfg.deepstack().cloned(),
         })
     }
@@ -2985,6 +3230,77 @@ impl IreeLlama {
         }
         Ok(out)
     }
+
+    /// Test support (issue #3028): the shim's decode-step scalar state
+    /// (`0` not attempted, `1` reuse active, `-1` fallback).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn test_decode_step_scalars_state(&self) -> i32 {
+        // Safety: the state is a plain field read from a live context.
+        unsafe { xla_test_decode_step_scalars_state(self.ctx) }
+    }
+
+    /// Test support (issue #3028): force the per-step allocation path on
+    /// (`true`) or clear the forced state (`false`), so a device test can drive
+    /// the fallback directly.
+    #[cfg(feature = "test-support")]
+    pub fn test_force_step_scalars_unsupported(&mut self, unsupported: bool) {
+        // Safety: only writes one state field on a live context.
+        unsafe { xla_test_force_step_scalars_unsupported(self.ctx, i32::from(unsupported)) };
+    }
+
+    /// Test support (issue #2954): run the token prefill C entry with exactly
+    /// the caller's positions. The public `prefill_*` path synthesizes
+    /// canonical positions, so this is the only way to prove the C boundary
+    /// bounds direct-caller values. `tokens` must be `context_capacity` long and
+    /// `positions` must be `context_capacity` (`3 * context_capacity` for
+    /// M-RoPE) long, matching what the entry reads; `real_len` may be shorter,
+    /// because the padded tail reaches the same gather.
+    #[cfg(feature = "test-support")]
+    pub fn test_prefill_with_positions(
+        &mut self,
+        tokens: &[i32],
+        positions: &[i32],
+        real_len: usize,
+    ) -> Result<i32, String> {
+        let axes = match self.position_mode {
+            PreparedPositionMode::OneD => 1,
+            PreparedPositionMode::Mrope3D => 3,
+        };
+        if tokens.len() != self.context_capacity {
+            return Err(format!(
+                "test prefill tokens must be context_capacity={} long, got {}",
+                self.context_capacity,
+                tokens.len()
+            ));
+        }
+        let expected = self.context_capacity * axes;
+        if positions.len() != expected {
+            return Err(format!(
+                "test prefill positions must be {expected} long ({axes} axes), got {}",
+                positions.len()
+            ));
+        }
+        let lp = checked_ffi_int(self.context_capacity, "context_capacity")?;
+        let real_len = checked_ffi_int(real_len, "real_len")?;
+        let mut out_token = 0i32;
+        // Safety: both slices outlive the call and match the C entry's expected
+        // lengths; `out_token` is a single valid output element.
+        let rc = unsafe {
+            xla_test_prefill(
+                self.ctx,
+                tokens.as_ptr(),
+                lp,
+                positions.as_ptr(),
+                real_len,
+                &mut out_token,
+            )
+        };
+        if rc != 0 {
+            return Err(format!("xla_test_prefill failed (status {rc})"));
+        }
+        Ok(out_token)
+    }
 }
 
 impl Drop for IreeLlama {
@@ -3039,6 +3355,11 @@ pub struct IreeRaggedLlama {
     vocab: usize,
     context_capacity: usize,
     hidden_size: usize,
+    /// Weight slots this engine declares, i.e. how many uploads one base load
+    /// must issue (issue #2961). Test-only so a device test can assert the
+    /// upload count instead of trusting it.
+    #[cfg(feature = "test-support")]
+    n_weights: usize,
     has_adapter_modes: bool,
     #[cfg(feature = "diagnostics")]
     model_layers: usize,
@@ -3157,6 +3478,7 @@ impl IreeRaggedLlama {
                 .count()
                 <= 1
         );
+        let load_started = std::time::Instant::now();
         let mut cfg = RuntimeConfig::from_json(model_dir, context_capacity)?;
         checked_ffi_int(b_max, "b_max")?;
         if !RAGGED_B_VALUES.contains(&b_max) {
@@ -3181,7 +3503,7 @@ impl IreeRaggedLlama {
                 );
             } else {
                 match rocm_arch() {
-                    Ok(arch) => match crate::native_qmv::hsaco(&arch) {
+                    Ok(arch) => match crate::native_qmv::hsaco_multi(&arch, b_max) {
                         Ok(bytes) => {
                             cfg.set_packed_args(true);
                             native_module =
@@ -3200,8 +3522,10 @@ impl IreeRaggedLlama {
             }
         }
         runtime_ffi_dimensions(&cfg, cfg.weight_specs().len())?;
+        report_load_timing("ragged-config", load_started);
         // Emit the logits prefill + the ragged decode graph for this model + b_max
         // at the device-resolved precision (f16 on GPU by default, f32 on CPU).
+        let emit_started = std::time::Instant::now();
         let precision = effective_precision(device, &cfg)?;
         let native_qmv = match &cfg {
             RuntimeConfig::Dense(_) => false,
@@ -3247,6 +3571,8 @@ impl IreeRaggedLlama {
                     ),
                 ),
             };
+        report_load_timing("ragged-emit", emit_started);
+        let compile_started = std::time::Instant::now();
         let bundle = compile_bundle(
             device,
             &cfg,
@@ -3262,6 +3588,7 @@ impl IreeRaggedLlama {
             &decode_mlir,
             &format!("decode_ragged_logits_b{b_max}"),
         )?;
+        report_load_timing("ragged-compile", compile_started);
         #[cfg(feature = "diagnostics")]
         let (diagnostic_vmfb, diagnostic_layout) = if diagnostics || all_layer_diagnostics {
             let (vmfb, layout) = compile_gemma3n_diagnostics(device, &cfg, all_layer_diagnostics)?;
@@ -3273,6 +3600,7 @@ impl IreeRaggedLlama {
         };
         #[cfg(not(feature = "diagnostics"))]
         debug_assert!(!diagnostics && !all_layer_diagnostics && !deepstack_diagnostics);
+        let ctx_started = std::time::Instant::now();
         let ctx = match base {
             Some(base) => create_bucket_ctx(base, &bundle, cfg.context_capacity())?,
             None => {
@@ -3292,13 +3620,26 @@ impl IreeRaggedLlama {
                 }
             }
         };
+        report_load_timing("ragged-context-and-upload", ctx_started);
         // Safety: ctx is a fresh valid context from create_ctx; free it on error.
         let b_max_ffi = checked_ffi_int(b_max, "b_max")?;
+        let reset_started = std::time::Instant::now();
+        // Record the compiled B before any reset. The ragged decode graph's
+        // static [B,...] shapes were fixed when it was emitted, so a reset at
+        // any other size can only fail inside IREE with an opaque shape error;
+        // binding first turns that into a clear rejection naming both values.
+        let rc = unsafe { xla_llama_ragged_bind(ctx, b_max_ffi) };
+        if rc != 0 {
+            unsafe { xla_llama_free(ctx) };
+            return Err(format!("xla_llama_ragged_bind failed (status {rc})"));
+        }
         let rc = unsafe { xla_llama_ragged_reset(ctx, b_max_ffi) };
         if rc != 0 {
             unsafe { xla_llama_free(ctx) };
             return Err(format!("xla_llama_ragged_reset failed (status {rc})"));
         }
+        report_load_timing("ragged-bind-and-reset", reset_started);
+        report_load_timing("ragged-total", load_started);
         Ok(Self {
             ctx,
             compatibility_fingerprint: bundle.compatibility_fingerprint,
@@ -3306,6 +3647,8 @@ impl IreeRaggedLlama {
             vocab: cfg.vocab(),
             context_capacity: cfg.context_capacity(),
             hidden_size: cfg.hidden(),
+            #[cfg(feature = "test-support")]
+            n_weights: cfg.weight_specs().len(),
             has_adapter_modes: cfg.has_adapter_modes(),
             #[cfg(feature = "diagnostics")]
             model_layers: cfg.n_layers(),
@@ -3367,6 +3710,14 @@ impl IreeRaggedLlama {
         self.b_max
     }
 
+    /// Test support (issue #2961): weight slots this engine declares. One base
+    /// load must issue exactly this many `xla_llama_upload_weight` calls.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn weight_count(&self) -> usize {
+        self.n_weights
+    }
+
     /// Clear all ragged KV slots before an independent diagnostic capture.
     ///
     /// Production batching retains slots between scheduler steps. Diagnostic
@@ -3382,6 +3733,105 @@ impl IreeRaggedLlama {
             return Err(format!("xla_llama_ragged_reset failed (status {rc})"));
         }
         Ok(())
+    }
+
+    /// Test support (issue #2923): record `compiled_b` as this context's
+    /// compiled ragged batch size and then reset to `bsz`, returning the shim's
+    /// status code. The engine's own `b_max` is rebound by the caller.
+    #[cfg(feature = "test-support")]
+    pub fn test_bind_and_reset(&mut self, compiled_b: i32, bsz: i32) -> i32 {
+        // Safety: `self.ctx` remains valid for the lifetime of this engine.
+        let rc = unsafe { xla_llama_ragged_bind(self.ctx, compiled_b) };
+        if rc != 0 {
+            return rc;
+        }
+        // Safety: as above; the reset only releases and re-sizes this ctx's
+        // batch state.
+        unsafe { xla_llama_ragged_reset(self.ctx, bsz) }
+    }
+
+    /// Test support (issue #2923): make the next prefill slot store fail after
+    /// its K transfer, so the caller can observe the slot's validity state. A
+    /// `false` call restores the normal path.
+    #[cfg(feature = "test-support")]
+    pub fn test_set_slot_store_failure(&mut self, fail: bool) {
+        // Safety: `self.ctx` remains valid for the lifetime of this engine.
+        unsafe { xla_test_set_slot_store_failure(self.ctx, i32::from(fail)) };
+    }
+
+    /// Test support (issue #2923): whether `slot` currently holds a KV store
+    /// that completed both transfers. `None` means the slot index is out of
+    /// range or no reset has allocated the flags.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn test_slot_valid(&self, slot: usize) -> Option<bool> {
+        let slot = checked_ffi_int(slot, "slot").ok()?;
+        // Safety: `self.ctx` remains valid for the lifetime of this engine.
+        match unsafe { xla_test_slot_valid(self.ctx, slot) } {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    }
+
+    /// Test support (issue #2954): run the slot-logits prefill C entry with
+    /// exactly the caller's positions. The public `prefill_slot_logits`
+    /// synthesizes canonical positions, so this is the only way to prove the C
+    /// boundary bounds direct-caller values. `tokens` must be
+    /// `context_capacity` long and `positions` must be `context_capacity`
+    /// (`3 * context_capacity` for M-RoPE) long; `real_len` may be shorter,
+    /// because the padded tail reaches the same gather.
+    #[cfg(feature = "test-support")]
+    pub fn test_prefill_slot_logits_with_positions(
+        &mut self,
+        slot: usize,
+        tokens: &[i32],
+        positions: &[i32],
+        real_len: usize,
+    ) -> Result<Vec<f32>, String> {
+        validate_slot(slot, self.b_max).map_err(|error| error.to_string())?;
+        let axes = match self.position_mode {
+            PreparedPositionMode::OneD => 1,
+            PreparedPositionMode::Mrope3D => 3,
+        };
+        if tokens.len() != self.context_capacity {
+            return Err(format!(
+                "test prefill tokens must be context_capacity={} long, got {}",
+                self.context_capacity,
+                tokens.len()
+            ));
+        }
+        let expected = self.context_capacity * axes;
+        if positions.len() != expected {
+            return Err(format!(
+                "test prefill positions must be {expected} long ({axes} axes), got {}",
+                positions.len()
+            ));
+        }
+        let slot = checked_ffi_int(slot, "slot")?;
+        let lp = checked_ffi_int(self.context_capacity, "context_capacity")?;
+        let real_len = checked_ffi_int(real_len, "real_len")?;
+        let vocab = checked_ffi_int(self.vocab, "vocab_size")?;
+        let mut logits = vec![0f32; self.vocab];
+        // Safety: both input slices outlive the call and match the C entry's
+        // expected lengths; `logits` has `self.vocab` elements for the shim to
+        // fill, and the shim also writes the slot's KV device-side.
+        let rc = unsafe {
+            xla_test_prefill_slot_logits(
+                self.ctx,
+                slot,
+                tokens.as_ptr(),
+                lp,
+                positions.as_ptr(),
+                real_len,
+                vocab,
+                logits.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return Err(format!("xla_test_prefill_slot_logits failed (status {rc})"));
+        }
+        Ok(logits)
     }
 
     /// The vocabulary size (logits per row). The engine slices the ragged decode's
@@ -4007,6 +4457,18 @@ impl IreeRaggedLlama {
                     "decode row {row} has negative M-RoPE coordinates {coordinates:?}"
                 ));
             }
+            // The compiled RoPE table has exactly `context_capacity` rows, so a
+            // coordinate at or past it is an out-of-bounds device gather. Reject
+            // here, before any IREE call (issue #2923).
+            if let Some(&coordinate) = coordinates
+                .iter()
+                .find(|&&coordinate| coordinate as usize >= self.context_capacity)
+            {
+                return Err(format!(
+                    "decode row {row} has M-RoPE coordinate {coordinate} outside context_capacity={}",
+                    self.context_capacity
+                ));
+            }
         }
         let flat_positions: Vec<i32> = positions
             .iter()
@@ -4045,5 +4507,49 @@ impl Drop for IreeRaggedLlama {
             unsafe { xla_llama_free(self.ctx) };
             self.ctx = std::ptr::null_mut();
         }
+    }
+}
+
+#[cfg(test)]
+mod load_timing_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn weight_buf_byte_lengths_match_the_shim_copy_size() {
+        assert_eq!(WeightBuf::F32(vec![0.0; 3]).byte_len(), 12);
+        assert_eq!(WeightBuf::F16(vec![0; 3]).byte_len(), 6);
+        assert_eq!(WeightBuf::Raw(vec![0; 5]).byte_len(), 5);
+    }
+
+    #[test]
+    fn upload_detail_reports_tensors_bytes_and_stage_milliseconds() {
+        let stats = WeightUploadStats {
+            tensors: 7,
+            uploaded_bytes: 1_500_000_000,
+            widen_micros: 2_400_000,
+            pack_micros: 300_000,
+            upload_micros: 900_000,
+        };
+        assert_eq!(
+            stats.detail(),
+            "tensors=7 uploaded_bytes=1500000000 dequantize_ms=2400 pack_ms=300 copy_ms=900"
+        );
+    }
+
+    #[test]
+    fn phase_line_keeps_its_shape_with_and_without_detail() {
+        assert_eq!(
+            load_timing_line("ragged-config", 12, "3456", None),
+            "mlxcel-xla-load: phase=ragged-config elapsed_ms=12 rss_kib=3456"
+        );
+        assert_eq!(
+            load_timing_line(
+                "language-weight-upload-parts",
+                4800,
+                "unavailable",
+                Some("tensors=0 uploaded_bytes=0"),
+            ),
+            "mlxcel-xla-load: phase=language-weight-upload-parts elapsed_ms=4800 rss_kib=unavailable tensors=0 uploaded_bytes=0"
+        );
     }
 }

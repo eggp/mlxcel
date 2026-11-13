@@ -710,6 +710,8 @@ impl BatchScheduler {
         is_multimodal: bool,
     ) {
         let history_prompt = ctx.history_prompt.take();
+        let root_prompt = ctx.root_prompt.take();
+        let root_tokens = ctx.root_prefix_tokens.take();
         if !self.engine.model().supports_snapshot_reuse()
             || is_multimodal
             || crate::server::prompt_cache::boundary_snapshot_disabled()
@@ -746,6 +748,33 @@ impl BatchScheduler {
         ctx.history_prefix_tokens =
             history_boundary_len(&history_tokens, prompt_tokens, min_prefix)
                 .map(|boundary| prompt_tokens[..boundary].to_vec());
+
+        // The system-prompt root (#2885 Part B), clipped the same way and kept
+        // only strictly before the history boundary.
+        let Some(min_prompt) = crate::server::prompt_cache::system_root_min_prompt_tokens() else {
+            return;
+        };
+        let root_tokens = match root_tokens {
+            Some(ids) => Some(ids),
+            None => root_prompt.and_then(|text| {
+                crate::server::model_provider::tokenize_prompt_for_generation(
+                    &self.tokenizer,
+                    &text,
+                )
+                .map_err(|err| tracing::debug!("system-root tokenization failed: {err}"))
+                .ok()
+            }),
+        };
+        ctx.root_prefix_tokens = root_tokens.and_then(|root| {
+            system_root_len(
+                &root,
+                prompt_tokens,
+                ctx.history_prefix_tokens.as_ref().map(Vec::len),
+                min_prefix,
+                min_prompt,
+            )
+            .map(|len| prompt_tokens[..len].to_vec())
+        });
     }
 
     /// Copy the model-owned state of `seq_id` and insert it into the
@@ -1168,6 +1197,153 @@ impl BatchScheduler {
             SnapshotOrigin::Boundary,
             encoded_span,
         );
+    }
+
+    /// Copy the model state at the end of `seq`'s system-prompt root and
+    /// insert it as a [`SnapshotOrigin::SystemRoot`] entry (#2885 Part B).
+    ///
+    /// Same mechanics as [`Self::insert_history_boundary_snapshot`]: the plan
+    /// forwarded `[.., root)` as one unpadded piece, so the state describes
+    /// exactly `prompt_tokens[..root]`. The entry is kept in this request's
+    /// session bucket like every other snapshot, so a new chat reuses it when
+    /// it resolves to the same session (the anonymous bucket of a client that
+    /// sets neither `prompt_cache_key` nor `user`, or a shared key).
+    pub(super) fn insert_system_root_snapshot(&mut self, seq: &SequenceInfo, root: usize) {
+        let _span = tracing::info_span!(
+            "system_root_snapshot",
+            seq_id = %seq.seq_id,
+            start = seq.prefill_start_offset,
+            root,
+            prompt_len = seq.prompt_tokens.len(),
+        )
+        .entered();
+        let ctx = match self.prompt_cache_seq_ctx.get(&seq.seq_id) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let root_tokens = seq.prompt_tokens[..root].to_vec();
+        let encoded_span = seq.prompt_tokens.len();
+        self.insert_model_state_snapshot(
+            seq.seq_id,
+            &ctx,
+            root_tokens,
+            SnapshotOrigin::SystemRoot,
+            encoded_span,
+        );
+    }
+
+    /// Insert the snapshot for the plan boundary `seq` just reached: the
+    /// system-prompt root when `end` is that split, the history boundary
+    /// otherwise.
+    pub(super) fn insert_boundary_snapshot(&mut self, seq: &SequenceInfo, end: usize) {
+        if self.system_root_split(seq) == Some(end) {
+            self.insert_system_root_snapshot(seq, end);
+        } else if self.history_boundary_split(seq) == Some(end) {
+            self.insert_history_boundary_snapshot(seq, end);
+        } else {
+            self.insert_checkpoint_snapshot(seq, end);
+        }
+    }
+
+    /// Copy the model state at the periodic checkpoint `end` and insert it as
+    /// a [`SnapshotOrigin::Checkpoint`] entry (#2885 Part B).
+    ///
+    /// Same mechanics as [`Self::insert_history_boundary_snapshot`]: the plan
+    /// forwarded `[.., end)` as pieces ending exactly at `end`, so the state
+    /// describes exactly `prompt_tokens[..end]`.
+    pub(super) fn insert_checkpoint_snapshot(&mut self, seq: &SequenceInfo, end: usize) {
+        let _span = tracing::info_span!(
+            "checkpoint_snapshot",
+            seq_id = %seq.seq_id,
+            start = seq.prefill_start_offset,
+            end,
+            prompt_len = seq.prompt_tokens.len(),
+        )
+        .entered();
+        let ctx = match self.prompt_cache_seq_ctx.get(&seq.seq_id) {
+            Some(c) => c.clone(),
+            None => return,
+        };
+        let tokens = seq.prompt_tokens[..end].to_vec();
+        let encoded_span = seq.prompt_tokens.len();
+        self.insert_model_state_snapshot(
+            seq.seq_id,
+            &ctx,
+            tokens,
+            SnapshotOrigin::Checkpoint,
+            encoded_span,
+        );
+    }
+
+    /// Every snapshot boundary `seq`'s `PrefillPlan` splits at: the
+    /// system-prompt root and the periodic checkpoints (#2885 Part B), and the
+    /// history boundary (#1143).
+    ///
+    /// The classic plan, the paged reservation estimate and both Gemma 4 MTP
+    /// prefill mirrors take their splits from here, so all of them build the
+    /// prompt state from the same partition.
+    pub(super) fn snapshot_splits(&self, seq: &SequenceInfo) -> PrefillSplits {
+        let root = self.system_root_split(seq);
+        let history = self.history_boundary_split(seq);
+        let reserved = usize::from(root.is_some()) + usize::from(history.is_some());
+        let mut points: Vec<usize> = [root, history].into_iter().flatten().collect();
+        points.extend(self.checkpoint_splits(seq, history, MAX_SPLITS - reserved));
+        PrefillSplits::from_points(&points)
+    }
+
+    /// The periodic checkpoints `seq`'s plan splits at (#2885 Part B): every
+    /// multiple of `MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL` after the adopted
+    /// prefix and before the history boundary (or the prompt end), under the
+    /// same gates as [`Self::history_boundary_split`]. Capped at `max`, the
+    /// deepest points kept.
+    pub(super) fn checkpoint_splits(
+        &self,
+        seq: &SequenceInfo,
+        history: Option<usize>,
+        max: usize,
+    ) -> Vec<usize> {
+        let Some(interval) = crate::server::prompt_cache::checkpoint_interval_tokens() else {
+            return Vec::new();
+        };
+        if !self.engine.model().supports_snapshot_reuse()
+            || !self.prompt_cache_active()
+            || seq.vlm_embeddings.is_some()
+            || !self.prompt_cache_seq_ctx.contains_key(&seq.seq_id)
+        {
+            return Vec::new();
+        }
+        let min_prefix = self
+            .prompt_cache
+            .as_ref()
+            .map(|s| s.min_prefix_tokens())
+            .unwrap_or(0);
+        checkpoint_points(
+            interval,
+            seq.prefill_start_offset,
+            history.unwrap_or(seq.prompt_tokens.len()),
+            min_prefix,
+            max,
+        )
+    }
+
+    /// The system-prompt root `seq`'s plan splits at (#2885 Part B), under the
+    /// same gates as [`Self::history_boundary_split`].
+    pub(super) fn system_root_split(&self, seq: &SequenceInfo) -> Option<usize> {
+        if !self.engine.model().supports_snapshot_reuse()
+            || !self.prompt_cache_active()
+            || seq.vlm_embeddings.is_some()
+        {
+            return None;
+        }
+        let tokens = self
+            .prompt_cache_seq_ctx
+            .get(&seq.seq_id)?
+            .root_prefix_tokens
+            .as_ref()?;
+        let root = tokens.len();
+        (boundary_capture_applies(root, seq.prefill_start_offset, seq.prompt_tokens.len())
+            && seq.prompt_tokens[..root] == tokens[..])
+            .then_some(root)
     }
 
     /// The history boundary `seq`'s `PrefillPlan` splits its prefill at

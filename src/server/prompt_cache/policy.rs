@@ -104,6 +104,183 @@ pub fn boundary_snapshot_disabled() -> bool {
     })
 }
 
+/// Default prompt length at or above which the system-prompt root snapshot is
+/// taken once `MLXCEL_PROMPT_CACHE_SYSTEM_ROOT` is on (#2885 Part B).
+pub const SYSTEM_ROOT_DEFAULT_MIN_PROMPT_TOKENS: usize = 2048;
+
+/// Opt-in switch for the system-prompt root snapshot (#2885 Part B).
+///
+/// A snapshot-only family can reuse a stored state only when a new prompt
+/// starts with exactly its tokens. The history boundary (#1143) covers the next
+/// turn of the same chat; it does not cover a fresh chat that shares only the
+/// system prompt and tool list with earlier ones, which is the common shape of
+/// an agent client. With this switch on, a chat prompt of at least the returned
+/// number of tokens also stores a snapshot at the end of its system block (the
+/// system messages and the tool list, plus the first user turn's header), so
+/// the next chat with the same system prompt starts after it.
+///
+/// `MLXCEL_PROMPT_CACHE_SYSTEM_ROOT`:
+/// * unset, empty or `0`: off (the default);
+/// * `1`, `on` or `true`: on, for prompts of at least
+///   [`SYSTEM_ROOT_DEFAULT_MIN_PROMPT_TOKENS`] tokens;
+/// * any other integer: on, with that minimum prompt length.
+///
+/// Ignored when the history boundary itself is disabled
+/// ([`boundary_snapshot_disabled`]), since both ride the same render and the
+/// same prefill split. Read once per process.
+///
+/// Used by: `server::chat_request::prepare_chat_request_with_cache`,
+/// `server::batch::scheduler::BatchScheduler::resolve_history_boundary`
+pub fn system_root_min_prompt_tokens() -> Option<usize> {
+    #[cfg(test)]
+    if let Some(value) = SYSTEM_ROOT_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return value;
+    }
+    static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        if boundary_snapshot_disabled() {
+            return None;
+        }
+        parse_system_root(
+            std::env::var("MLXCEL_PROMPT_CACHE_SYSTEM_ROOT")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static SYSTEM_ROOT_TEST_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`system_root_min_prompt_tokens`] for the current test thread until the
+/// guard drops, without touching the process environment.
+#[cfg(test)]
+pub(crate) fn override_system_root_for_test(value: Option<usize>) -> impl Drop {
+    struct Reset(Option<Option<usize>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SYSTEM_ROOT_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = SYSTEM_ROOT_TEST_OVERRIDE.with(|cell| cell.replace(Some(value)));
+    Reset(previous)
+}
+
+/// Parse an `MLXCEL_PROMPT_CACHE_SYSTEM_ROOT` value; see
+/// [`system_root_min_prompt_tokens`]. Invalid text warns once and stays off.
+pub(crate) fn parse_system_root(value: Option<&str>) -> Option<usize> {
+    let raw = value?.trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" => None,
+        "1" | "on" | "true" => Some(SYSTEM_ROOT_DEFAULT_MIN_PROMPT_TOKENS),
+        other => match other.parse::<usize>() {
+            Ok(min) => Some(min),
+            Err(_) => {
+                tracing::warn!(
+                    "MLXCEL_PROMPT_CACHE_SYSTEM_ROOT={raw:?} is neither a switch nor a token count; the system-prompt root snapshot stays off"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Default spacing of the periodic prefill checkpoints once
+/// `MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL` is on (#2885 Part B).
+pub const CHECKPOINT_DEFAULT_INTERVAL_TOKENS: usize = 16_384;
+
+/// Smallest interval the environment variable accepts. Each checkpoint is one
+/// more prefill split and one more state copy, so a tiny interval would turn
+/// a long prompt into many short forwards.
+const CHECKPOINT_MIN_INTERVAL_TOKENS: usize = 256;
+
+/// Opt-in switch for periodic prefill checkpoints (#2885 Part B).
+///
+/// The history boundary (#1143) and the system-prompt root cover a chat that
+/// appends to its previous turn and a new chat that shares only the system
+/// block. Neither covers an agent that rewrites or compacts its history a few
+/// thousand tokens back into a long context: the history snapshot no longer
+/// matches and the root is far behind the edit. With this switch on, a
+/// snapshot-family prefill also splits at every multiple of the returned
+/// interval before its history boundary and stores a snapshot there, so such
+/// a request resumes from the last checkpoint before the edit.
+///
+/// The points are absolute multiples of the interval, so they depend only on
+/// the prompt prefix: a later prompt that shares the first `k * interval`
+/// tokens splits there too, and a hit on that checkpoint forwards the same
+/// pieces as the cold run of the same prompt.
+///
+/// `MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL`:
+/// * unset, empty or `0`: off (the default);
+/// * `1`, `on` or `true`: on, every [`CHECKPOINT_DEFAULT_INTERVAL_TOKENS`];
+/// * any other integer of at least 256: on, with that interval.
+///
+/// Ignored when the history boundary is disabled ([`boundary_snapshot_disabled`]).
+/// Read once per process.
+///
+/// Used by: `server::batch::scheduler::BatchScheduler::checkpoint_splits`
+pub fn checkpoint_interval_tokens() -> Option<usize> {
+    #[cfg(test)]
+    if let Some(value) = CHECKPOINT_TEST_OVERRIDE.with(std::cell::Cell::get) {
+        return value;
+    }
+    static VALUE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        if boundary_snapshot_disabled() {
+            return None;
+        }
+        parse_checkpoint_interval(
+            std::env::var("MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static CHECKPOINT_TEST_OVERRIDE: std::cell::Cell<Option<Option<usize>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Pin [`checkpoint_interval_tokens`] for the current test thread until the
+/// guard drops, without touching the process environment. Accepts any
+/// interval, including ones below the environment variable's floor.
+#[cfg(test)]
+pub(crate) fn override_checkpoint_interval_for_test(value: Option<usize>) -> impl Drop {
+    struct Reset(Option<Option<usize>>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CHECKPOINT_TEST_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+    let previous = CHECKPOINT_TEST_OVERRIDE.with(|cell| cell.replace(Some(value)));
+    Reset(previous)
+}
+
+/// Parse an `MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL` value; see
+/// [`checkpoint_interval_tokens`]. Invalid text or an interval below the
+/// floor warns and stays off.
+pub(crate) fn parse_checkpoint_interval(value: Option<&str>) -> Option<usize> {
+    let raw = value?.trim();
+    match raw.to_ascii_lowercase().as_str() {
+        "" | "0" | "off" | "false" => None,
+        "1" | "on" | "true" => Some(CHECKPOINT_DEFAULT_INTERVAL_TOKENS),
+        other => match other.parse::<usize>() {
+            Ok(interval) if interval >= CHECKPOINT_MIN_INTERVAL_TOKENS => Some(interval),
+            _ => {
+                tracing::warn!(
+                    "MLXCEL_PROMPT_CACHE_CHECKPOINT_INTERVAL={raw:?} is neither a switch nor a token interval of at least {CHECKPOINT_MIN_INTERVAL_TOKENS}; periodic checkpoints stay off"
+                );
+                None
+            }
+        },
+    }
+}
+
 /// Operator kill switch for the background prompt-cache warm-up (issue #1144).
 ///
 /// Separate from [`boundary_snapshot_disabled`] on purpose. The boundary
@@ -354,5 +531,58 @@ impl fmt::Display for PromptCacheStats {
             self.snapshot_lookups,
             self.snapshot_self_evictions,
         )
+    }
+}
+
+#[cfg(test)]
+mod system_root_tests {
+    use super::{SYSTEM_ROOT_DEFAULT_MIN_PROMPT_TOKENS, parse_system_root};
+
+    #[test]
+    fn system_root_switch_parses_off_on_and_thresholds() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("nope"),
+        ] {
+            assert_eq!(parse_system_root(off), None, "{off:?}");
+        }
+        for on in ["1", "on", "TRUE", " true "] {
+            assert_eq!(
+                parse_system_root(Some(on)),
+                Some(SYSTEM_ROOT_DEFAULT_MIN_PROMPT_TOKENS),
+                "{on:?}"
+            );
+        }
+        assert_eq!(parse_system_root(Some("4096")), Some(4096));
+        assert_eq!(parse_system_root(Some("2")), Some(2));
+    }
+
+    #[test]
+    fn checkpoint_interval_parses_off_on_and_rejects_tiny_intervals() {
+        use super::{CHECKPOINT_DEFAULT_INTERVAL_TOKENS, parse_checkpoint_interval};
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("nope"),
+            Some("255"),
+        ] {
+            assert_eq!(parse_checkpoint_interval(off), None, "{off:?}");
+        }
+        for on in ["1", "on", "TRUE", " true "] {
+            assert_eq!(
+                parse_checkpoint_interval(Some(on)),
+                Some(CHECKPOINT_DEFAULT_INTERVAL_TOKENS),
+                "{on:?}"
+            );
+        }
+        assert_eq!(parse_checkpoint_interval(Some("256")), Some(256));
+        assert_eq!(parse_checkpoint_interval(Some("8192")), Some(8192));
     }
 }
